@@ -29,7 +29,7 @@ pub async fn check_and_optimize_if_needed(
 
     // Periodic optimization check (only inserter 0, every 300 batches total, at most once per 15 minutes)
     // Don't check until we've done at least 300 batches (skip the very first check)
-    if inserter_id != 0 || total_batches <= 300 || !total_batches.is_multiple_of(300) {
+    if inserter_id != 0 || total_batches <= 300 || total_batches % 300 != 0 {
         return false;
     }
 
