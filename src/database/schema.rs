@@ -1021,7 +1021,7 @@ impl SchemaManager {
                 }
 
                 // Step 2: Drop the table
-                match self.connection.drop_table(table_name, &[]).await {
+                match self.connection.drop_table(table_name).await {
                     Ok(_) => {
                         tracing::info!("Successfully dropped table {}", table_name);
                     }
@@ -1219,7 +1219,7 @@ impl SchemaManager {
         }
 
         // Step 2: Drop table
-        self.connection.drop_table(table_name, &[]).await?;
+        self.connection.drop_table(table_name).await?;
         tracing::info!("Dropped table {}", table_name);
 
         // Step 3: Recreate table

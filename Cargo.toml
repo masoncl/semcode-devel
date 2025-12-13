@@ -6,10 +6,11 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-lancedb = "0.22"
-arrow = "56.2"
-arrow-array = "56.2"
-arrow-schema = "56.2"
+home = "=0.5.11"
+lancedb = { version = "0.21", default-features = false }
+arrow = "55.2"
+arrow-array = "55.2"
+arrow-schema = "55.2"
 tokio = { version = "1.47.1", features = ["full"] }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0"
@@ -53,8 +54,29 @@ similar = { version = "2.7", features = ["text"] }  # Proper diff algorithm for 
 shlex = "1.3"           # Shell-like parsing for quoted strings in CLI
 reqwest = { version = "0.11", features = ["blocking", "gzip"] }  # HTTP client for manifest downloads
 flate2 = "1.0"          # gzip compression/decompression
-chrono = "0.4.42"
+chrono = "0.4.41"
 chrono-english = "0.1"  # Natural language date parsing
+
+# Force older AWS versions compatible with Rust 1.86
+aws-config = "=1.8.8"
+aws-credential-types = "=1.2.8"
+aws-runtime = "=1.5.12"
+aws-sdk-dynamodb = "=1.96.0"
+aws-sdk-sso = "=1.87.0"
+aws-sdk-ssooidc = "=1.89.0"
+aws-sdk-sts = "=1.89.0"
+aws-sigv4 = "=1.3.5"
+aws-smithy-async = "=1.2.6"
+aws-smithy-http = "=0.62.5"
+aws-smithy-http-client = "=1.1.4"
+aws-smithy-json = "=0.61.7"
+aws-smithy-observability = "=0.1.4"
+aws-smithy-query = "=0.60.8"
+aws-smithy-runtime = "=1.9.4"
+aws-smithy-runtime-api = "=1.9.2"
+aws-smithy-types = "=1.3.4"
+aws-smithy-xml = "=0.60.12"
+aws-types = "=1.3.9"
 
 [[bin]]
 name = "semcode-index"
