@@ -5362,6 +5362,14 @@ async fn index_current_commit_background(
                                         changed_file.path,
                                         &new_hash[..8]
                                     );
+                                    // The on-disk index already covers this commit; mark
+                                    // status Completed so indexing_status reflects readiness.
+                                    {
+                                        let mut state = indexing_state.lock().await;
+                                        state.status =
+                                            IndexingStatus::Completed { files_processed: 0 };
+                                        state.completed_at = Some(std::time::SystemTime::now());
+                                    }
                                     return;
                                 } else {
                                     eprintln!(
@@ -5372,10 +5380,14 @@ async fn index_current_commit_background(
                                 }
                             }
                             Err(e) => {
-                                eprintln!(
-                                    "[Background] Warning: Failed to get processed files: {}",
-                                    e
-                                );
+                                let error_msg = format!("Failed to query processed files: {}", e);
+                                eprintln!("[Background] Warning: {}", error_msg);
+                                let mut state = indexing_state.lock().await;
+                                state.status = IndexingStatus::Failed {
+                                    error: error_msg.clone(),
+                                };
+                                state.completed_at = Some(std::time::SystemTime::now());
+                                send_notification(format!("Semcode: {}", error_msg));
                                 return;
                             }
                         }
@@ -5841,6 +5853,103 @@ mod tests {
         let content = result["content"][0]["text"].as_str().unwrap();
         assert!(content.contains("Completed (100 files processed)"));
         assert!(content.contains("5.00s"));
+    }
+
+    /// Regression test for the background-indexing "already indexed" fast-path.
+    ///
+    /// When the MCP server restarts against an already-indexed commit,
+    /// `index_current_commit_background` previously returned early after
+    /// detecting the file's (path, blob) pair in `processed_files`, leaving
+    /// `IndexingStatus::NotStarted` behind even though `started_at` had been
+    /// set. The handler then reported `Status: Not started` + `Elapsed:
+    /// Xs (ongoing)` forever, and downstream tooling (kernel-reviewer's
+    /// readiness gate) fell back to grep.
+    ///
+    /// This test exercises that fast-path end-to-end and asserts the state
+    /// transitions to `Completed { files_processed: 0 }`.
+    #[tokio::test]
+    async fn test_background_indexing_fast_path_sets_completed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+
+        let git = |args: &[&str]| -> String {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .env("GIT_AUTHOR_NAME", "test")
+                .env("GIT_AUTHOR_EMAIL", "test@test.com")
+                .env("GIT_COMMITTER_NAME", "test")
+                .env("GIT_COMMITTER_EMAIL", "test@test.com")
+                .output()
+                .expect("git command failed to execute");
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
+        // Two-commit repo so HEAD~1..HEAD yields a Modified .c file.
+        git(&["init", "-b", "main"]);
+        std::fs::write(repo.join("foo.c"), "int v;\n").unwrap();
+        git(&["add", "foo.c"]);
+        git(&["commit", "-m", "A"]);
+        std::fs::write(repo.join("foo.c"), "int v2;\n").unwrap();
+        git(&["add", "foo.c"]);
+        git(&["commit", "-m", "B"]);
+
+        let head_sha = git(&["rev-parse", "HEAD"]);
+        let blob_sha = git(&["rev-parse", "HEAD:foo.c"]);
+
+        let db_dir = repo.join(".semcode.db");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        let db = Arc::new(
+            DatabaseManager::new(db_dir.to_str().unwrap(), repo.to_string_lossy().to_string())
+                .await
+                .unwrap(),
+        );
+        db.create_tables().await.unwrap();
+
+        // Pre-populate processed_files so the fast-path skip triggers.
+        db.mark_file_processed("foo.c".to_string(), Some(head_sha.clone()), blob_sha)
+            .await
+            .unwrap();
+
+        let state = Arc::new(tokio::sync::Mutex::new(IndexingState::new()));
+        let notification_tx = Arc::new(tokio::sync::Mutex::new(None));
+
+        index_current_commit_background(
+            db,
+            repo.to_string_lossy().to_string(),
+            state.clone(),
+            notification_tx,
+        )
+        .await;
+
+        let final_state = state.lock().await;
+        assert!(
+            matches!(
+                final_state.status,
+                IndexingStatus::Completed { files_processed: 0 }
+            ),
+            "fast-path skip must transition status to Completed; got {:?}",
+            final_state.status
+        );
+        assert!(
+            final_state.completed_at.is_some(),
+            "completed_at must be set after fast-path skip"
+        );
+        assert!(
+            final_state.started_at.is_some(),
+            "started_at must be set by the task prologue"
+        );
+        assert_eq!(
+            final_state.git_sha.as_deref(),
+            Some(head_sha.as_str()),
+            "git_sha must match the SHA the task prologue resolved at HEAD"
+        );
     }
 
     #[tokio::test]
