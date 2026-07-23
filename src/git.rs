@@ -48,6 +48,30 @@ pub fn normalize_repo_path<P: AsRef<Path>>(path: P) -> String {
     path_buf.to_string_lossy().replace('\\', "/")
 }
 
+/// Get canonical repository root identity string (`repo_identity`).
+/// Resolves linked worktrees and bare repos to their shared core `common_dir` path,
+/// with `$HOME` normalized to `~` and backslashes normalized to `/`.
+pub fn get_repo_root<P: AsRef<Path>>(path: P) -> String {
+    let path = path.as_ref();
+    let abs_input = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().unwrap_or_default().join(path)
+    };
+
+    let p = gix::discover(&abs_input)
+        .map(|repo| repo.common_dir().to_path_buf())
+        .unwrap_or_else(|_| abs_input.clone());
+
+    let abs_p = if p.is_absolute() {
+        p
+    } else {
+        abs_input.join(p)
+    };
+
+    normalize_repo_path(abs_p)
+}
+
 use once_cell::sync::Lazy;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -246,6 +270,18 @@ mod tests {
         if let Some(home) = dirs::home_dir() {
             if current_dir.starts_with(&home) {
                 assert!(normalized.starts_with("~"));
+            }
+        }
+    }
+
+    #[test]
+    fn test_get_repo_root() {
+        let root = get_repo_root(".");
+        assert!(!root.is_empty());
+        assert!(!root.contains('\\'));
+        if let Some(home) = dirs::home_dir() {
+            if std::env::current_dir().unwrap().starts_with(&home) {
+                assert!(root.starts_with("~"));
             }
         }
     }
