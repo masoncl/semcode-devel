@@ -72,6 +72,83 @@ pub fn get_repo_root<P: AsRef<Path>>(path: P) -> String {
     normalize_repo_path(abs_p)
 }
 
+/// Helper to canonicalize a path or return its original PathBuf if canonicalization fails.
+fn canonicalize_or_original(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Canonicalize a path even if the final file or subdirectories do not exist yet on disk.
+fn canonicalize_existing_ancestors(path: &Path) -> PathBuf {
+    if let Ok(canon) = std::fs::canonicalize(path) {
+        return canon;
+    }
+    let mut missing = Vec::new();
+    let mut curr = path;
+    while let Some(parent) = curr.parent() {
+        if let Some(name) = curr.file_name() {
+            missing.push(name);
+        }
+        if let Ok(canon_parent) = std::fs::canonicalize(parent) {
+            let mut result = canon_parent;
+            for component in missing.into_iter().rev() {
+                result.push(component);
+            }
+            return result;
+        }
+        curr = parent;
+    }
+    path.to_path_buf()
+}
+
+/// Determine if a database path (`db_path`) is local to a repository (`repo_path`).
+/// Returns `(repo_identity, is_local_db)`.
+pub fn determine_db_locality<P: AsRef<Path>>(repo_path: P, db_path: &str) -> (String, bool) {
+    let repo_path = repo_path.as_ref();
+    let git_repo_identity = get_repo_root(repo_path);
+    let mut local_roots = Vec::new();
+
+    if let Ok(repo) = gix::discover(repo_path) {
+        let common = canonicalize_or_original(repo.common_dir());
+        if !repo.is_bare() && common.ends_with(".git") {
+            if let Some(main_root) = common.parent() {
+                local_roots.push(main_root.to_path_buf());
+            }
+        }
+        local_roots.push(common);
+
+        if let Some(workdir) = repo.workdir() {
+            local_roots.push(canonicalize_or_original(workdir));
+        }
+    } else {
+        local_roots.push(canonicalize_or_original(repo_path));
+    }
+
+    let db_path_buf = PathBuf::from(db_path);
+    let preferred_root = local_roots.iter().rev().find(|p| p.is_dir());
+
+    let db_abs = if db_path_buf.is_absolute() {
+        db_path_buf
+    } else if let Some(target_root) = preferred_root {
+        target_root.join(db_path_buf)
+    } else {
+        std::env::current_dir()
+            .unwrap_or_default()
+            .join(db_path_buf)
+    };
+
+    let real_target = std::fs::read_link(&db_abs).unwrap_or_else(|_| db_abs.clone());
+    let real_target_abs = if real_target.is_absolute() {
+        real_target
+    } else {
+        db_abs.parent().unwrap_or(Path::new(".")).join(real_target)
+    };
+
+    let db_canonical = canonicalize_existing_ancestors(&real_target_abs);
+    let is_local_db = local_roots.iter().any(|r| db_canonical.starts_with(r));
+
+    (git_repo_identity, is_local_db)
+}
+
 use once_cell::sync::Lazy;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -284,6 +361,122 @@ mod tests {
                 assert!(root.starts_with("~"));
             }
         }
+    }
+
+    #[test]
+    fn test_determine_db_locality_local() {
+        let (identity, is_local) = determine_db_locality(".", ".semcode.db");
+        assert!(!identity.is_empty());
+        assert!(is_local, "Database inside repository should be local");
+    }
+
+    #[test]
+    fn test_determine_db_locality_external() {
+        let (identity, is_local) = determine_db_locality(".", "/tmp/semcode_external_test.db");
+        assert!(!identity.is_empty());
+        assert!(
+            !is_local,
+            "Database outside repository should be shared/external"
+        );
+    }
+
+    #[test]
+    fn test_determine_db_locality_non_existent_nested_path() {
+        let (identity, is_local) =
+            determine_db_locality(".", "target/non_existent_subdir/deep_nested/db.semcode");
+        assert!(!identity.is_empty());
+        assert!(
+            is_local,
+            "Relative DB path inside non-existent subdirectory of repo should be local"
+        );
+    }
+
+    #[test]
+    fn test_determine_db_locality_bare_repo() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let bare_repo_dir = temp_dir.path().join("test_bare.git");
+        let status = std::process::Command::new("git")
+            .args(["init", "--bare", bare_repo_dir.to_str().unwrap()])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        // Local DB inside bare repo directory
+        let local_db = bare_repo_dir.join("semcode.db");
+        let (identity, is_local) =
+            determine_db_locality(&bare_repo_dir, local_db.to_str().unwrap());
+        assert!(!identity.is_empty());
+        assert!(is_local, "DB inside bare repo directory should be local");
+
+        // External DB outside bare repo
+        let external_db = temp_dir.path().join("external.db");
+        let (_, is_local_ext) =
+            determine_db_locality(&bare_repo_dir, external_db.to_str().unwrap());
+        assert!(
+            !is_local_ext,
+            "DB outside bare repo directory should be external"
+        );
+    }
+
+    #[test]
+    fn test_determine_db_locality_worktree() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let main_repo = temp_dir.path().join("main_repo");
+        std::fs::create_dir_all(&main_repo).unwrap();
+
+        // Init main repo and create initial commit
+        let run_git = |dir: &Path, args: &[&str]| {
+            let res = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_AUTHOR_NAME", "test")
+                .env("GIT_AUTHOR_EMAIL", "test@test.com")
+                .env("GIT_COMMITTER_NAME", "test")
+                .env("GIT_COMMITTER_EMAIL", "test@test.com")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .output()
+                .unwrap();
+            assert!(res.status.success(), "Git command failed: {:?}", res);
+        };
+
+        run_git(&main_repo, &["init", "-b", "main"]);
+        std::fs::write(main_repo.join("README.md"), "hello").unwrap();
+        run_git(&main_repo, &["add", "."]);
+        run_git(&main_repo, &["commit", "-m", "initial commit"]);
+
+        // Create linked worktree
+        let worktree_dir = temp_dir.path().join("linked_worktree");
+        run_git(
+            &main_repo,
+            &[
+                "worktree",
+                "add",
+                worktree_dir.to_str().unwrap(),
+                "-b",
+                "wt-branch",
+            ],
+        );
+
+        // DB inside linked worktree
+        let wt_db = worktree_dir.join(".semcode.db");
+        let (wt_identity, is_wt_local) =
+            determine_db_locality(&worktree_dir, wt_db.to_str().unwrap());
+        assert!(is_wt_local, "DB inside linked worktree should be local");
+
+        // DB inside main repo queried from linked worktree
+        let main_db = main_repo.join(".semcode.db");
+        let (main_identity, is_main_local) =
+            determine_db_locality(&worktree_dir, main_db.to_str().unwrap());
+        assert!(
+            is_main_local,
+            "DB inside main repo queried from worktree should be local"
+        );
+
+        // Identity of worktree and main repo should match (canonical common_dir)
+        assert_eq!(wt_identity, main_identity);
     }
 
     #[test]
