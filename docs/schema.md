@@ -363,6 +363,7 @@ branch_name         (Utf8, NOT NULL)     - Branch name (e.g., "main", "origin/de
 tip_commit          (Utf8, NOT NULL)     - Commit SHA at the tip when indexed (40-char hex)
 indexed_at          (Int64, NOT NULL)    - Unix timestamp of when branch was last indexed
 remote              (Utf8, nullable)     - Remote name if tracking branch (e.g., "origin")
+repo_path           (Utf8, nullable)     - Canonical repository identity path for multi-repo scoping
 ```
 
 **Purpose:**
@@ -370,6 +371,7 @@ remote              (Utf8, nullable)     - Remote name if tracking branch (e.g.,
 - Enables efficient multi-branch indexing by skipping already-current branches
 - Supports both local branches (e.g., "main") and remote-tracking branches (e.g., "origin/develop")
 - Stores indexing timestamp for freshness tracking
+- Scopes branch references per repository in multi-repository shared database mode
 
 **Use Cases:**
 - Multi-branch indexing: `semcode-index --branches main,develop,feature-x`
@@ -381,6 +383,7 @@ remote              (Utf8, nullable)     - Remote name if tracking branch (e.g.,
 - BTree on `branch_name` (primary lookup by branch name)
 - BTree on `tip_commit` (find branches at specific commits)
 - BTree on `remote` (filter by remote)
+- BTree on `repo_path` (fast repo-scoped branch query pruning)
 
 ---
 
@@ -509,9 +512,19 @@ The git_commits table stores git commit history with enhanced metadata:
 - **Walk-back Symbol Extraction**: Fast O(modified_lines × 50) algorithm identifies changed functions, types, and macros
 - **Dual-file Analysis**: Extracts symbols from both additions and deletions
 - **Enhanced Hunk Headers**: Git-style `@@ ... @@ symbol` format for better context
-- **Commit Traversal**: Parent relationships enable git history analysis
-- **Tag Parsing**: Extracts structured metadata from commit messages (Signed-off-by, Reviewed-by, etc.)
 - **Use Cases**: Commit analysis, code evolution tracking, review assistance, git history search
+
+### Multi-Repository Shared Database Support & Database Locality
+
+**Overview:**
+When operating `semcode` with a shared central database (e.g., `SEMCODE_DB=~/.cache/semcode.db` or an external directory shared across multiple trees of a project), branch records are isolated by repository identity (`repo_path`) to prevent cross-repository branch pollution.
+
+**Database Locality Modes:**
+- **Local Database Mode**: When the database resides inside a repository directory (such as `.git/` or `.semcode.db`), branch store queries use the fallback filter `(repo_path = '{repo_identity}' OR repo_path IS NULL)`. This ensures position-independent relocatability and full backward compatibility with unscoped legacy records while matching current repository branches.
+- **Shared / Central Database Mode**: When the database resides in a central location outside all repositories, queries strictly filter `repo_path = '{repo_identity}'` to ensure clean separation between repositories.
+- **Worktree Identity Consolidation**: Linked Git worktrees automatically resolve to their primary repository identity (`common_dir`), sharing the same branch index without duplication.
+- **On-Write Lazy Migration**: Older database tables are lazily migrated on write operations (`record_branch_indexed`) by adding the `repo_path` column JIT without interrupting read queries.
+- **Automatic Garbage Collection**: `DatabaseManager::garbage_collect()` automatically purges branch records corresponding to deleted filesystem paths in shared mode, and purges legacy unscoped `NULL` records when running in standalone database mode.
 
 ## Query Patterns
 
