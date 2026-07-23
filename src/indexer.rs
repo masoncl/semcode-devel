@@ -5,6 +5,7 @@
 //! that can be called from different binaries (semcode-index, semcode, semcode-mcp, etc.)
 
 use anyhow::Result;
+use gix::revision::walk::Sorting;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -87,12 +88,11 @@ pub async fn check_and_optimize_if_needed(
 
 /// Parse git range and get all commit SHAs in the range.
 ///
-/// Walks first-parent chain from B back to A, avoiding gix's rev_walk + with_hidden
-/// which does an O(all commits) graph painting that is catastrophically slow on large repos.
+/// List commit SHAs in a range using gitoxide's rev_walk.
 ///
 /// Supports two formats:
-/// 1. "A..B" - commits reachable from B but not from A (first-parent walk)
-/// 2. "REF" (no ..) - all commits reachable from REF via first-parent (for initial indexing)
+/// 1. "A..B" - commits reachable from B but not from A
+/// 2. "REF" (no ..) - all commits reachable from REF (for initial indexing)
 pub fn list_shas_in_range(repo: &gix::Repository, range: &str) -> Result<Vec<String>> {
     let (from_spec, to_spec) = if range.contains("..") {
         let parts: Vec<&str> = range.split("..").collect();
@@ -107,14 +107,20 @@ pub fn list_shas_in_range(repo: &gix::Repository, range: &str) -> Result<Vec<Str
     let to_commit = resolve_to_commit(repo, to_spec)?;
     let to_id = to_commit.id().detach();
 
-    let stop_at = if from_spec.is_empty() {
-        None
+    let walk = if from_spec.is_empty() {
+        repo.rev_walk([to_id])
+            .sorting(Sorting::ByCommitTime(Default::default()))
+            .all()?
     } else {
         match resolve_to_commit(repo, from_spec) {
-            Ok(from_commit) => Some(from_commit.id().detach()),
+            Ok(from_commit) => {
+                let from_id = from_commit.id().detach();
+                repo.rev_walk([to_id])
+                    .with_hidden([from_id])
+                    .sorting(Sorting::ByCommitTime(Default::default()))
+                    .all()?
+            }
             Err(e) => {
-                // Parent commit not found (shallow clone or root commit).
-                // Fall back to returning just the target commit.
                 info!(
                     "Could not resolve '{}' ({}); falling back to single-commit indexing",
                     from_spec, e
@@ -125,18 +131,10 @@ pub fn list_shas_in_range(repo: &gix::Repository, range: &str) -> Result<Vec<Str
     };
 
     let mut shas = Vec::new();
-    let mut current_id = to_id;
     const MAX_COMMITS: usize = 10000000;
 
-    loop {
-        // Stop if we've reached the exclusion boundary
-        if let Some(ref stop) = stop_at {
-            if current_id == *stop {
-                break;
-            }
-        }
-
-        shas.push(current_id.to_string());
+    for info in walk {
+        let info = info?;
 
         if shas.len() > MAX_COMMITS {
             return Err(anyhow::anyhow!(
@@ -146,20 +144,7 @@ pub fn list_shas_in_range(repo: &gix::Repository, range: &str) -> Result<Vec<Str
             ));
         }
 
-        // Get the first parent to continue walking.
-        // In shallow clones, parent objects may be missing — treat as end of history.
-        let commit = match repo.find_commit(current_id) {
-            Ok(c) => c,
-            Err(_) => break,
-        };
-        let parent_ids: Vec<_> = commit.parent_ids().collect();
-
-        if parent_ids.is_empty() {
-            // Root commit, no more parents
-            break;
-        }
-
-        current_id = parent_ids[0].detach();
+        shas.push(info.id().to_string());
     }
 
     // Reverse to get chronological order (oldest first)
@@ -985,42 +970,57 @@ pub async fn process_lore_commits_pipeline(
 
                 match batch {
                     Ok(emails) => {
-                        let batch_len = emails.len();
-
                         // Insert batch into database
-                        if let Err(e) = db_manager_clone.insert_lore_emails(&emails).await {
-                            error!("Inserter {} failed to insert batch: {}", inserter_id, e);
-                        } else {
-                            // Record processed commit SHAs so they are
-                            // not re-examined on subsequent runs.
-                            let shas: Vec<String> = emails
-                                .iter()
-                                .map(|e| e.git_commit_sha.as_str())
-                                .collect::<std::collections::HashSet<_>>()
-                                .into_iter()
-                                .map(String::from)
-                                .collect();
-                            if let Err(e) =
-                                db_manager_clone.insert_lore_indexed_commits(&shas).await
-                            {
-                                error!(
-                                    "Inserter {} failed to record indexed commits: {}",
-                                    inserter_id, e
-                                );
+                        match db_manager_clone.insert_lore_emails(&emails).await {
+                            Err(e) => {
+                                error!("Inserter {} failed to insert batch: {}", inserter_id, e);
                             }
+                            Ok(failed_indices) => {
+                                let failed_set: std::collections::HashSet<usize> =
+                                    failed_indices.into_iter().collect();
+                                let success_count = emails.len() - failed_set.len();
 
-                            let count = inserted_clone.fetch_add(batch_len, Ordering::Relaxed);
-                            pb_clone.set_message(format!("Inserted {} emails", count + batch_len));
+                                // Record commit SHAs only for emails that
+                                // were actually stored, so that failed
+                                // emails are retried on the next run.
+                                let shas: Vec<String> = emails
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(i, _)| !failed_set.contains(i))
+                                    .map(|(_, e)| e.git_commit_sha.as_str())
+                                    .collect::<std::collections::HashSet<_>>()
+                                    .into_iter()
+                                    .map(String::from)
+                                    .collect();
+                                if !shas.is_empty() {
+                                    if let Err(e) =
+                                        db_manager_clone.insert_lore_indexed_commits(&shas).await
+                                    {
+                                        error!(
+                                            "Inserter {} failed to record indexed commits: {}",
+                                            inserter_id, e
+                                        );
+                                    }
+                                }
 
-                            // Track successful batch insertions and check for periodic optimization
-                            let total_batches = batches_counter.fetch_add(1, Ordering::Relaxed) + 1;
-                            check_and_optimize_if_needed(
-                                &db_manager_clone,
-                                inserter_id,
-                                total_batches,
-                                &optimization_check_timer,
-                            )
-                            .await;
+                                let count =
+                                    inserted_clone.fetch_add(success_count, Ordering::Relaxed);
+                                pb_clone.set_message(format!(
+                                    "Inserted {} emails",
+                                    count + success_count
+                                ));
+
+                                // Track successful batch insertions and check for periodic optimization
+                                let total_batches =
+                                    batches_counter.fetch_add(1, Ordering::Relaxed) + 1;
+                                check_and_optimize_if_needed(
+                                    &db_manager_clone,
+                                    inserter_id,
+                                    total_batches,
+                                    &optimization_check_timer,
+                                )
+                                .await;
+                            }
                         }
                     }
                     Err(_) => {
@@ -1135,4 +1135,154 @@ pub async fn index_git_commits(
     info!("Commits indexed: {}", commit_count);
 
     Ok(commit_count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper: run a git command in a directory, panic on failure.
+    fn git(repo: &std::path::Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "test@test.com")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "test@test.com")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .expect("git command failed to execute");
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// Build a repo with merge topology and a tag on the side branch:
+    ///
+    ///   A -- B -- M -- D   (main)
+    ///         \      /
+    ///          C ---       (tagged "v1")
+    ///
+    /// Returns (tempdir, repo, sha_a, sha_b, sha_c, sha_m, sha_d).
+    fn create_merge_repo() -> (
+        tempfile::TempDir,
+        gix::Repository,
+        String,
+        String,
+        String,
+        String,
+        String,
+    ) {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let p = tmpdir.path();
+
+        git(p, &["init", "-b", "main"]);
+
+        // Commit A
+        std::fs::write(p.join("a.txt"), "a").unwrap();
+        git(p, &["add", "a.txt"]);
+        git(p, &["commit", "-m", "A"]);
+        let sha_a = git(p, &["rev-parse", "HEAD"]);
+
+        // Commit B
+        std::fs::write(p.join("b.txt"), "b").unwrap();
+        git(p, &["add", "b.txt"]);
+        git(p, &["commit", "-m", "B"]);
+        let sha_b = git(p, &["rev-parse", "HEAD"]);
+
+        // Side branch with commit C, tagged "v1"
+        git(p, &["checkout", "-b", "side"]);
+        std::fs::write(p.join("c.txt"), "c").unwrap();
+        git(p, &["add", "c.txt"]);
+        git(p, &["commit", "-m", "C"]);
+        let sha_c = git(p, &["rev-parse", "HEAD"]);
+        git(p, &["tag", "v1"]);
+
+        // Back to main, merge side → creates merge commit M
+        git(p, &["checkout", "main"]);
+        git(p, &["merge", "side", "--no-ff", "-m", "M"]);
+        let sha_m = git(p, &["rev-parse", "HEAD"]);
+
+        // Commit D on top
+        std::fs::write(p.join("d.txt"), "d").unwrap();
+        git(p, &["add", "d.txt"]);
+        git(p, &["commit", "-m", "D"]);
+        let sha_d = git(p, &["rev-parse", "HEAD"]);
+
+        let repo = gix::open(p).unwrap();
+        (tmpdir, repo, sha_a, sha_b, sha_c, sha_m, sha_d)
+    }
+
+    /// Regression test: a tag on a side branch (not on the first-parent
+    /// chain) must still correctly bound the range.  A first-parent-only
+    /// walk would miss it and traverse the entire history.
+    #[test]
+    fn test_list_shas_tag_on_side_branch() {
+        let (_tmp, repo, _sha_a, _sha_b, _sha_c, sha_m, sha_d) = create_merge_repo();
+
+        let shas = list_shas_in_range(&repo, "v1..HEAD").unwrap();
+
+        // v1 points at C (on the side branch).  The range v1..HEAD
+        // should include M and D only — NOT A, B, or C.
+        assert!(
+            shas.contains(&sha_m),
+            "merge commit M should be in v1..HEAD"
+        );
+        assert!(shas.contains(&sha_d), "commit D should be in v1..HEAD");
+        assert_eq!(
+            shas.len(),
+            2,
+            "v1..HEAD should contain exactly 2 commits (M, D), got {}: {:?}",
+            shas.len(),
+            shas
+        );
+    }
+
+    /// Range where the start IS on the first-parent chain works too.
+    #[test]
+    fn test_list_shas_first_parent_boundary() {
+        let (_tmp, repo, sha_a, sha_b, sha_c, sha_m, sha_d) = create_merge_repo();
+
+        let shas = list_shas_in_range(&repo, &format!("{sha_a}..HEAD")).unwrap();
+
+        // A..HEAD should include B, C, M, D (everything after A).
+        let expected: std::collections::HashSet<&str> = [
+            sha_b.as_str(),
+            sha_c.as_str(),
+            sha_m.as_str(),
+            sha_d.as_str(),
+        ]
+        .into_iter()
+        .collect();
+        let got: std::collections::HashSet<&str> = shas.iter().map(|s| s.as_str()).collect();
+
+        assert_eq!(expected, got, "A..HEAD should be {{B, C, M, D}}");
+    }
+
+    /// No range separator — returns all reachable commits.
+    #[test]
+    fn test_list_shas_no_range() {
+        let (_tmp, repo, sha_a, sha_b, sha_c, sha_m, sha_d) = create_merge_repo();
+
+        let shas = list_shas_in_range(&repo, "HEAD").unwrap();
+
+        let expected: std::collections::HashSet<&str> = [
+            sha_a.as_str(),
+            sha_b.as_str(),
+            sha_c.as_str(),
+            sha_m.as_str(),
+            sha_d.as_str(),
+        ]
+        .into_iter()
+        .collect();
+        let got: std::collections::HashSet<&str> = shas.iter().map(|s| s.as_str()).collect();
+
+        assert_eq!(expected, got, "HEAD (no range) should return all 5 commits");
+    }
 }

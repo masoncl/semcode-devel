@@ -1080,30 +1080,30 @@ async fn main() -> Result<()> {
                 total_emails_all_archives
             );
 
-            // Optimize before creating FTS indices so that compaction
-            // does not orphan the index data that was just built.
             if total_new_emails > 0 {
-                match db_manager.check_optimization_health().await {
-                    Ok((needs_optimization, message)) => {
-                        if needs_optimization {
-                            println!("\n{}", message);
-                            match db_manager.optimize_database().await {
-                                Ok(_) => println!("Database optimization completed successfully"),
-                                Err(e) => error!("Failed to optimize database: {}", e),
-                            }
-                        } else {
-                            println!("\n{}", message);
-                        }
-                    }
-                    Err(e) => {
-                        error!("Failed to check database health: {}", e);
-                    }
+                // Compact only lore tables.  The full optimize_database()
+                // method processes every table in the database including
+                // code-index tables and content shards that a lore run
+                // never touches.  On memory-constrained systems the
+                // combined working set triggers the OOM killer.
+                println!("\nCompacting lore tables...");
+                match db_manager.compact_lore_tables().await {
+                    Ok(_) => println!("Lore table compaction completed successfully"),
+                    Err(e) => error!("Failed to compact lore tables: {}", e),
                 }
 
-                println!("\nCreating FTS indices for lore table...");
-                match db_manager.create_lore_fts_indices().await {
-                    Ok(_) => println!("FTS indices created successfully"),
-                    Err(e) => eprintln!("Warning: Failed to create FTS indices: {}", e),
+                // Create FTS indices on first run; merge new rows on
+                // subsequent runs.  LanceDB's native FTS engine serves
+                // unindexed rows via brute-force fallback, so queries
+                // remain correct before optimize completes.
+                println!("\nUpdating FTS indices for lore table...");
+                match db_manager.ensure_lore_fts_indices().await {
+                    Ok(_) => {}
+                    Err(e) => eprintln!("Warning: Failed to ensure FTS indices: {}", e),
+                }
+                match db_manager.optimize_lore_fts_indices().await {
+                    Ok(_) => println!("FTS indices updated successfully"),
+                    Err(e) => eprintln!("Warning: Failed to optimize FTS indices: {}", e),
                 }
             }
 
@@ -1248,30 +1248,21 @@ async fn main() -> Result<()> {
                 }
             }
 
-            // Optimize before creating FTS indices so that compaction
-            // does not orphan the index data that was just built.
             if total_new_emails > 0 {
-                match db_manager.check_optimization_health().await {
-                    Ok((needs_optimization, message)) => {
-                        if needs_optimization {
-                            println!("\n{}", message);
-                            match db_manager.optimize_database().await {
-                                Ok(_) => println!("Database optimization completed successfully"),
-                                Err(e) => error!("Failed to optimize database: {}", e),
-                            }
-                        } else {
-                            println!("\n{}", message);
-                        }
-                    }
-                    Err(e) => {
-                        error!("Failed to check database health: {}", e);
-                    }
+                println!("\nCompacting lore tables...");
+                match db_manager.compact_lore_tables().await {
+                    Ok(_) => println!("Lore table compaction completed successfully"),
+                    Err(e) => error!("Failed to compact lore tables: {}", e),
                 }
 
-                println!("\nCreating FTS indices for lore table...");
-                match db_manager.create_lore_fts_indices().await {
-                    Ok(_) => println!("FTS indices created successfully"),
-                    Err(e) => eprintln!("Warning: Failed to create FTS indices: {}", e),
+                println!("\nUpdating FTS indices for lore table...");
+                match db_manager.ensure_lore_fts_indices().await {
+                    Ok(_) => {}
+                    Err(e) => eprintln!("Warning: Failed to ensure FTS indices: {}", e),
+                }
+                match db_manager.optimize_lore_fts_indices().await {
+                    Ok(_) => println!("FTS indices updated successfully"),
+                    Err(e) => eprintln!("Warning: Failed to optimize FTS indices: {}", e),
                 }
             }
 
@@ -1669,7 +1660,8 @@ async fn run_pipeline(args: Args) -> Result<()> {
         }
     }
 
-    // Optimization is now handled inside process_git_range for all modes
+    // Perform database garbage collection for stale branch records
+    let _ = db_manager.garbage_collect().await;
 
     // Drop and recreate if requested
     if args.drop_recreate {

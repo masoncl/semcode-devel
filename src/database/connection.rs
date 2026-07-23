@@ -24,13 +24,22 @@ use crate::types::{FunctionInfo, TypeInfo, TypedefInfo};
 use crate::vectorizer::CodeVectorizer;
 use crate::workdir::WorkdirIndex;
 use std::collections::HashSet;
+use std::path::PathBuf;
 
 // Optimal batch size for LanceDB operations
 pub const OPTIMAL_BATCH_SIZE: usize = 65536;
 
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct GcStats {
+    pub deleted_stale_branch_records: usize,
+}
+
 pub struct DatabaseManager {
     connection: Connection,
-    git_repo_path: String,
+    db_path: String,
+    work_dir: String,
+    repo_identity: String,
+    is_local_db: bool,
     function_store: FunctionStore,
     type_store: TypeStore,
     typedef_store: TypedefStore,
@@ -45,22 +54,26 @@ pub struct DatabaseManager {
 }
 
 impl DatabaseManager {
-    pub async fn new(db_path: &str, git_repo_path: String) -> Result<Self> {
+    pub async fn new(db_path: &str, work_dir: String) -> Result<Self> {
         let connection = lancedb::connect(db_path).execute().await?;
+        let (repo_identity, is_local_db) = crate::git::determine_db_locality(&work_dir, db_path);
 
         Ok(Self {
             connection: connection.clone(),
-            git_repo_path: git_repo_path.clone(),
+            db_path: db_path.to_string(),
+            work_dir: work_dir.clone(),
+            repo_identity: repo_identity.clone(),
+            is_local_db,
             function_store: FunctionStore::new(connection.clone()),
             type_store: TypeStore::new(connection.clone()),
             typedef_store: TypedefStore::new(connection.clone()),
-            search_manager: SearchManager::new(connection.clone(), git_repo_path),
+            search_manager: SearchManager::new(connection.clone(), work_dir),
             vector_search_manager: VectorSearchManager::new(connection.clone()),
             schema_manager: SchemaManager::new(connection.clone()),
             processed_file_store: ProcessedFileStore::new(connection.clone()),
             content_store: ContentStore::new(connection.clone()),
             symbol_filename_store: SymbolFilenameStore::new(connection.clone()),
-            branch_store: IndexedBranchStore::new(connection.clone()),
+            branch_store: IndexedBranchStore::new(connection.clone(), repo_identity, is_local_db),
             workdir_index: std::sync::RwLock::new(None),
         })
     }
@@ -504,14 +517,28 @@ impl DatabaseManager {
         self.schema_manager.compact_and_cleanup().await
     }
 
+    pub async fn compact_lore_tables(&self) -> Result<()> {
+        self.schema_manager.compact_lore_tables().await
+    }
+
     /// Drop and recreate all tables for maximum space savings
     pub async fn drop_and_recreate_tables(&self) -> Result<()> {
         self.schema_manager.drop_and_recreate_tables().await
     }
 
-    /// Create FTS indices for lore table (must be called after data is inserted)
+    /// Drop and rebuild all FTS indices for the lore table from scratch.
     pub async fn create_lore_fts_indices(&self) -> Result<()> {
         self.schema_manager.create_lore_fts_indices().await
+    }
+
+    /// Create FTS indices only if they do not already exist.
+    pub async fn ensure_lore_fts_indices(&self) -> Result<()> {
+        self.schema_manager.ensure_lore_fts_indices().await
+    }
+
+    /// Merge newly-inserted rows into existing lore FTS indices.
+    pub async fn optimize_lore_fts_indices(&self) -> Result<()> {
+        self.schema_manager.optimize_lore_fts_indices().await
     }
 
     /// Get lore table information including row count and indices
@@ -2592,14 +2619,14 @@ impl DatabaseManager {
         file_paths: &[String],
         git_sha: &str,
     ) -> Result<std::collections::HashMap<String, String>> {
-        match crate::git::resolve_files_at_commit(&self.git_repo_path, git_sha, file_paths) {
+        match crate::git::resolve_files_at_commit(&self.work_dir, git_sha, file_paths) {
             Ok(resolved_hashes) => {
                 // If no files were resolved, log this as a warning
                 if resolved_hashes.is_empty() {
                     tracing::warn!(
                         "No files were resolved at commit {} in repository {}",
                         git_sha,
-                        self.git_repo_path
+                        self.work_dir
                     );
                 }
 
@@ -2607,7 +2634,7 @@ impl DatabaseManager {
             }
             Err(e) => {
                 tracing::error!("DatabaseManager::resolve_git_file_hashes: Failed to resolve git files at commit {}: {}", git_sha, e);
-                tracing::error!("Repository path: {}", self.git_repo_path);
+                tracing::error!("Repository path: {}", self.work_dir);
                 tracing::error!("Requested file paths: {:?}", file_paths);
                 Ok(std::collections::HashMap::new()) // Return empty map instead of failing, let caller handle
             }
@@ -2699,6 +2726,14 @@ impl DatabaseManager {
 
     // ==================== Branch Management ====================
 
+    pub fn repo_identity(&self) -> &str {
+        &self.repo_identity
+    }
+
+    pub fn is_local_db(&self) -> bool {
+        self.is_local_db
+    }
+
     /// Record that a branch has been indexed at a specific commit
     pub async fn record_branch_indexed(
         &self,
@@ -2707,6 +2742,7 @@ impl DatabaseManager {
         remote: Option<&str>,
     ) -> Result<()> {
         use crate::database::branches::IndexedBranchInfo;
+        let repo_path = (!self.is_local_db).then(|| self.repo_identity.clone());
         let info = IndexedBranchInfo {
             branch_name: branch_name.to_string(),
             tip_commit: tip_commit.to_string(),
@@ -2715,6 +2751,7 @@ impl DatabaseManager {
                 .unwrap()
                 .as_secs() as i64,
             remote: remote.map(|s| s.to_string()),
+            repo_path,
         };
         self.branch_store.record_branch_indexed(&info).await
     }
@@ -2767,6 +2804,93 @@ impl DatabaseManager {
     /// Get count of indexed branches
     pub async fn get_indexed_branch_count(&self) -> Result<usize> {
         self.branch_store.count().await
+    }
+
+    /// Performs garbage collection on stale branch records belonging to deleted repository paths.
+    pub async fn garbage_collect(&self) -> Result<GcStats> {
+        let mut stats = GcStats::default();
+
+        let table = match self
+            .connection
+            .open_table("indexed_branches")
+            .execute()
+            .await
+        {
+            Ok(t) => t,
+            Err(_) => return Ok(stats),
+        };
+
+        use futures::TryStreamExt;
+        let results = table
+            .query()
+            .only_if("repo_path IS NOT NULL")
+            .execute()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        let mut known_repo_paths = HashSet::new();
+        for batch in &results {
+            if let Some(col) = batch.column_by_name("repo_path") {
+                if let Some(arr) = col.as_any().downcast_ref::<arrow::array::StringArray>() {
+                    for i in 0..batch.num_rows() {
+                        if !arr.is_null(i) {
+                            known_repo_paths.insert(arr.value(i).to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut repo_paths_to_clean = Vec::new();
+        for rp in known_repo_paths {
+            let expanded_path = if let Some(stripped) = rp.strip_prefix("~/") {
+                if let Some(home) = dirs::home_dir() {
+                    home.join(stripped)
+                } else {
+                    PathBuf::from(&rp)
+                }
+            } else {
+                PathBuf::from(&rp)
+            };
+
+            if !expanded_path.exists() {
+                repo_paths_to_clean.push(rp);
+            }
+        }
+
+        for stale_rp in repo_paths_to_clean {
+            let escaped = stale_rp.replace("'", "''");
+            let filter = format!("repo_path = '{escaped}'");
+            let _ = table.delete(&filter).await;
+            stats.deleted_stale_branch_records += 1;
+        }
+
+        // If the database directory does not reside within any Git repository,
+        // it is a standalone/central database that can never be local to any repository.
+        // In this case, un-scoped legacy (repo_path IS NULL) records can never be read
+        // and are safe to clean up.
+        let db_dir = std::path::Path::new(&self.db_path)
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."));
+        let is_inside_any_git_repo = gix::discover(db_dir).is_ok();
+
+        if !is_inside_any_git_repo {
+            let null_results = table
+                .query()
+                .only_if("repo_path IS NULL")
+                .execute()
+                .await?
+                .try_collect::<Vec<_>>()
+                .await?;
+            let null_count: usize = null_results.iter().map(|b| b.num_rows()).sum();
+            if null_count > 0 {
+                let _ = table.delete("repo_path IS NULL").await;
+                stats.deleted_stale_branch_records += null_count;
+            }
+        }
+
+        Ok(stats)
     }
 
     // ==================== End Branch Management ====================
@@ -2826,7 +2950,7 @@ impl DatabaseManager {
         );
 
         // Step 1: Get directly changed files between commits
-        let changed_files = get_changed_files(&self.git_repo_path, commit_a, commit_b)?;
+        let changed_files = get_changed_files(&self.work_dir, commit_a, commit_b)?;
         let mut files_to_scan = std::collections::HashSet::new();
 
         // Add all directly changed files (except deleted ones)
@@ -3288,7 +3412,7 @@ impl DatabaseManager {
             }
             None => {
                 // Default to current commit
-                match crate::git::get_git_sha(&self.git_repo_path) {
+                match crate::git::get_git_sha(&self.work_dir) {
                     Ok(Some(current_sha)) => {
                         tracing::info!("Using current git commit SHA: {}", current_sha);
                         current_sha
@@ -3423,16 +3547,12 @@ impl DatabaseManager {
         let mut manifest = std::collections::HashMap::new();
 
         // Use shared tree traversal utility
-        crate::git::walk_tree_at_commit(
-            &self.git_repo_path,
-            git_sha,
-            |relative_path, object_id| {
-                // Normalize path by removing any double slashes
-                let normalized_path = relative_path.replace("//", "/");
-                manifest.insert(normalized_path, object_id.to_string());
-                Ok(())
-            },
-        )?;
+        crate::git::walk_tree_at_commit(&self.work_dir, git_sha, |relative_path, object_id| {
+            // Normalize path by removing any double slashes
+            let normalized_path = relative_path.replace("//", "/");
+            manifest.insert(normalized_path, object_id.to_string());
+            Ok(())
+        })?;
 
         // Merge with workdir overlay (adds dirty files, removes deleted files)
         Ok(self.workdir_merged_manifest(manifest))
@@ -3933,13 +4053,19 @@ impl DatabaseManager {
         Ok(())
     }
 
-    /// Insert lore emails into the database
-    pub async fn insert_lore_emails(&self, emails: &[crate::types::LoreEmailInfo]) -> Result<()> {
+    /// Insert lore emails into the database, returning the indices of
+    /// any emails that could not be stored.  Callers must not record
+    /// commit SHAs for failed indices in the lore_indexed_commits
+    /// table, otherwise those emails are permanently lost.
+    pub async fn insert_lore_emails(
+        &self,
+        emails: &[crate::types::LoreEmailInfo],
+    ) -> Result<Vec<usize>> {
         use arrow::datatypes::{DataType, Field, Schema};
         use std::sync::Arc;
 
         if emails.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
 
         tracing::info!(
@@ -3961,10 +4087,10 @@ impl DatabaseManager {
             Field::new("symbols", DataType::Utf8, false),
         ]));
 
-        // Deduplicate by message_id within the batch. A lore archive
-        // can contain the same email in multiple git commits, and
-        // LanceDB merge_insert requires each target row to be matched
-        // by at most one source row. Keep the last occurrence.
+        // Deduplicate by message_id within the batch.  A lore
+        // archive can contain the same email in multiple git commits;
+        // appending duplicates would create redundant rows.  Keep the
+        // last occurrence.
         let mut seen = std::collections::HashMap::with_capacity(emails.len());
         for (i, email) in emails.iter().enumerate() {
             seen.insert(&email.message_id, i);
@@ -3983,38 +4109,50 @@ impl DatabaseManager {
 
         let table = self.connection.open_table("lore").execute().await?;
 
-        // Try inserting the full batch first -- a single merge_insert
-        // is far cheaper than many small ones because each call is a
-        // full read-modify-write cycle in LanceDB.  Fall back to
-        // chunked insertion only when the batch exhausts DataFusion's
-        // memory pool (the RepartitionExec OOM described in the
-        // comment below).
-        //
-        // Retrying the full set of indices on failure is safe:
-        // merge_insert is not transactional, so a failed call may
-        // have persisted some rows before the error.  Because the
-        // upsert key is message_id, re-inserting those rows is
-        // idempotent.
-        if let Err(e) = Self::merge_insert_lore_chunk(&table, emails, &dedup_indices, &schema).await
-        {
+        let mut failed_indices: Vec<usize> = Vec::new();
+
+        // Filter out emails whose message_id already exists in the
+        // table.  Normally every email here is new because
+        // index_lore_archive skips already-indexed commits, but a
+        // partial failure on a previous run can leave rows in the
+        // table whose commit SHA was never recorded in
+        // lore_indexed_commits.  Filtering avoids duplicates without
+        // relying on merge_insert, which hits a spurious null-column
+        // error in lance-file 3.0.1.
+        let new_indices = Self::filter_existing_lore_ids(&table, emails, &dedup_indices).await?;
+
+        if new_indices.len() < dedup_indices.len() {
+            tracing::info!(
+                "insert_lore_emails: {} of {} already in table, inserting {}",
+                dedup_indices.len() - new_indices.len(),
+                dedup_indices.len(),
+                new_indices.len(),
+            );
+        }
+
+        if new_indices.is_empty() {
+            tracing::info!("insert_lore_emails: no new emails to insert");
+            return Ok(failed_indices);
+        }
+
+        // Use table.add() instead of merge_insert.  merge_insert in
+        // lance-file 3.0.1 introduces spurious nulls during its
+        // internal join/write phase, causing every insert to fail
+        // with "subject contained null values".  Plain append avoids
+        // the merge codepath entirely.  Duplicates are prevented by
+        // the filter_existing_lore_ids check above.
+        if let Err(e) = Self::add_lore_chunk(&table, emails, &new_indices, &schema).await {
             tracing::warn!(
                 "insert_lore_emails: full batch of {} failed ({}), \
                  falling back to chunked insertion",
-                dedup_indices.len(),
+                new_indices.len(),
                 e
             );
 
-            // Lore emails carry full bodies, so each row is large
-            // compared to code-analysis records.  LanceDB
-            // merge_insert uses DataFusion's RepartitionExec, whose
-            // memory pool can be exhausted by a single oversized
-            // RecordBatch.  Insert in sub-batches to bound peak
-            // memory per operation.
             const MAX_CHUNK: usize = 128;
 
-            for chunk in dedup_indices.chunks(MAX_CHUNK) {
-                if let Err(e) = Self::merge_insert_lore_chunk(&table, emails, chunk, &schema).await
-                {
+            for chunk in new_indices.chunks(MAX_CHUNK) {
+                if let Err(e) = Self::add_lore_chunk(&table, emails, chunk, &schema).await {
                     tracing::warn!(
                         "insert_lore_emails: chunk of {} failed ({}), \
                          retrying individually",
@@ -4022,8 +4160,7 @@ impl DatabaseManager {
                         e
                     );
                     for &idx in chunk {
-                        if let Err(e2) =
-                            Self::merge_insert_lore_chunk(&table, emails, &[idx], &schema).await
+                        if let Err(e2) = Self::add_lore_chunk(&table, emails, &[idx], &schema).await
                         {
                             tracing::warn!(
                                 "insert_lore_emails: skipping \
@@ -4031,20 +4168,80 @@ impl DatabaseManager {
                                 emails[idx].message_id,
                                 e2
                             );
+                            failed_indices.push(idx);
                         }
                     }
                 }
             }
         }
 
+        if !failed_indices.is_empty() {
+            tracing::warn!(
+                "insert_lore_emails: {} of {} emails failed to insert",
+                failed_indices.len(),
+                new_indices.len()
+            );
+        }
+
         tracing::info!("insert_lore_emails: Batch insertion complete");
 
-        Ok(())
+        Ok(failed_indices)
+    }
+
+    /// Return the subset of `indices` whose message_id does not
+    /// already exist in the lore table.
+    async fn filter_existing_lore_ids(
+        table: &lancedb::Table,
+        emails: &[crate::types::LoreEmailInfo],
+        indices: &[usize],
+    ) -> Result<Vec<usize>> {
+        use futures::TryStreamExt as _;
+
+        // Build an IN-list predicate.  message_ids are already
+        // validated to be non-empty, but escape single quotes for
+        // the SQL literal.
+        let id_list: Vec<String> = indices
+            .iter()
+            .map(|&i| format!("'{}'", emails[i].message_id.replace('\'', "''")))
+            .collect();
+
+        let predicate = format!("message_id IN ({})", id_list.join(", "));
+
+        let stream = table
+            .query()
+            .select(lancedb::query::Select::Columns(vec![
+                "message_id".to_string()
+            ]))
+            .only_if(&predicate)
+            .execute()
+            .await?;
+        let batches: Vec<_> = stream.try_collect().await?;
+
+        let mut existing = std::collections::HashSet::new();
+        for batch in &batches {
+            if let Some(col) = batch.column_by_name("message_id") {
+                let arr = col
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .expect("message_id column must be StringArray");
+                for i in 0..arr.len() {
+                    if !arr.is_null(i) {
+                        existing.insert(arr.value(i).to_string());
+                    }
+                }
+            }
+        }
+
+        Ok(indices
+            .iter()
+            .copied()
+            .filter(|&i| !existing.contains(&emails[i].message_id))
+            .collect())
     }
 
     /// Build a [`RecordBatch`] from the given email indices and
-    /// merge-insert it into the lore table.
-    async fn merge_insert_lore_chunk(
+    /// append it to the lore table.
+    async fn add_lore_chunk(
         table: &lancedb::Table,
         emails: &[crate::types::LoreEmailInfo],
         indices: &[usize],
@@ -4098,15 +4295,7 @@ impl DatabaseManager {
         ];
 
         let batch = RecordBatch::try_new(schema.clone(), columns)?;
-        let batches = vec![Ok(batch)];
-        let batch_iterator =
-            arrow::record_batch::RecordBatchIterator::new(batches.into_iter(), schema.clone());
-
-        let mut merge_insert = table.merge_insert(&["message_id"]);
-        merge_insert
-            .when_matched_update_all(None)
-            .when_not_matched_insert_all();
-        merge_insert.execute(Box::new(batch_iterator)).await?;
+        table.add(vec![batch]).execute().await?;
         Ok(())
     }
 
@@ -4293,18 +4482,42 @@ impl DatabaseManager {
         let mut first_iteration = true;
 
         loop {
-            let fts_query =
-                FullTextSearchQuery::new(fts_pattern.clone()).with_column(field.to_owned())?;
+            // When the FTS pattern is empty (e.g. regex ".*" has no
+            // alphanumeric tokens), skip FTS and use a plain table
+            // scan so the regex post-filter still runs.
+            let batches: Vec<_> = if fts_pattern.is_empty() {
+                tracing::info!(
+                    "FTS pattern empty for field '{}', falling back to table scan",
+                    field
+                );
+                let mut query_builder = table.query();
+                if let Some(ref filter) = date_filter {
+                    query_builder = query_builder.only_if(filter);
+                }
+                query_builder
+                    .limit(fts_limit)
+                    .execute()
+                    .await?
+                    .try_collect()
+                    .await?
+            } else {
+                let fts_query =
+                    FullTextSearchQuery::new(fts_pattern.clone()).with_column(field.to_owned())?;
 
-            let mut query_builder = table.query().full_text_search(fts_query);
+                let mut query_builder = table.query().full_text_search(fts_query);
 
-            // Apply date filter at database level so limit applies to date-filtered results
-            if let Some(ref filter) = date_filter {
-                query_builder = query_builder.only_if(filter);
-            }
+                // Apply date filter at database level so limit applies to date-filtered results
+                if let Some(ref filter) = date_filter {
+                    query_builder = query_builder.only_if(filter);
+                }
 
-            let stream = query_builder.limit(fts_limit).execute().await?;
-            let batches: Vec<_> = stream.try_collect().await?;
+                query_builder
+                    .limit(fts_limit)
+                    .execute()
+                    .await?
+                    .try_collect()
+                    .await?
+            };
 
             let fts_count: usize = batches.iter().map(|b| b.num_rows()).sum();
             tracing::info!(
@@ -4468,6 +4681,7 @@ impl DatabaseManager {
 
     /// Helper function to query lore emails by multiple fields and return intersection
     /// Uses regex alternation for OR within fields, intersection for AND across fields
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn query_lore_by_fields_intersection(
         &self,
         from_patterns: Option<&[String]>,
@@ -4475,18 +4689,35 @@ impl DatabaseManager {
         body_patterns: Option<&[String]>,
         recipients_patterns: Option<&[String]>,
         search_limit: usize,
+        since_date: Option<&str>,
+        until_date: Option<&str>,
     ) -> Result<std::collections::HashSet<String>> {
         use std::collections::HashSet;
 
         let lore_table = self.connection.open_table("lore").execute().await?;
         let mut field_result_sets: Vec<HashSet<String>> = Vec::new();
 
-        // Helper function to query a field using FTS with regex post-filtering
+        // Parse date filters into DateTime for temporal comparison
+        // in query_field_impl (RFC 2822 string comparison is not
+        // meaningful for date ordering).
+        let since_dt = since_date
+            .and_then(|d| chrono::DateTime::parse_from_rfc2822(d).ok())
+            .map(|dt| dt.with_timezone(&chrono::Utc));
+        let until_dt = until_date
+            .and_then(|d| chrono::DateTime::parse_from_rfc2822(d).ok())
+            .map(|dt| dt.with_timezone(&chrono::Utc));
+
+        // Helper function to query a field using FTS with regex and
+        // date post-filtering.  Selects the "date" column alongside
+        // the searched field so temporal filtering happens on the
+        // already-fetched FTS candidates without extra lookups.
         async fn query_field_impl(
             lore_table: &lancedb::Table,
             field_name: String,
             pattern: String,
             search_limit: usize,
+            since: Option<chrono::DateTime<chrono::Utc>>,
+            until: Option<chrono::DateTime<chrono::Utc>>,
         ) -> Result<HashSet<String>> {
             // FTS uses simple tokenizer - normalize pattern by stripping special chars
             let fts_pattern = pattern
@@ -4502,28 +4733,52 @@ impl DatabaseManager {
                 fts_pattern
             );
 
-            let fts_query =
-                FullTextSearchQuery::new(fts_pattern).with_column(field_name.clone())?;
-            let mut query = lore_table.query().full_text_search(fts_query).select(
-                lancedb::query::Select::Columns(vec![
-                    "message_id".to_string(),
-                    "_score".to_string(),
-                    field_name.clone(),
-                ]),
-            );
-
-            // Apply limit - use large limit if search_limit is 0 (unlimited)
-            // FTS has a default limit of 10, so we must explicitly set a large limit
             let effective_limit = if search_limit > 0 {
                 search_limit
             } else {
                 100000
             };
-            query = query.limit(effective_limit);
 
-            let results = query.execute().await?.try_collect::<Vec<_>>().await?;
+            // When the FTS pattern is empty (e.g. regex ".*" has no
+            // alphanumeric tokens), skip FTS and fall back to a plain
+            // table scan so the regex post-filter still runs.
+            let results = if fts_pattern.is_empty() {
+                tracing::info!(
+                    "FTS pattern empty for field '{}', falling back to table scan",
+                    field_name
+                );
+                lore_table
+                    .query()
+                    .select(lancedb::query::Select::Columns(vec![
+                        "message_id".to_string(),
+                        field_name.clone(),
+                        "date".to_string(),
+                    ]))
+                    .limit(effective_limit)
+                    .execute()
+                    .await?
+                    .try_collect::<Vec<_>>()
+                    .await?
+            } else {
+                let fts_query =
+                    FullTextSearchQuery::new(fts_pattern).with_column(field_name.clone())?;
+                lore_table
+                    .query()
+                    .full_text_search(fts_query)
+                    .select(lancedb::query::Select::Columns(vec![
+                        "message_id".to_string(),
+                        "_score".to_string(),
+                        field_name.clone(),
+                        "date".to_string(),
+                    ]))
+                    .limit(effective_limit)
+                    .execute()
+                    .await?
+                    .try_collect::<Vec<_>>()
+                    .await?
+            };
 
-            // Step 2: Post-filter with regex in memory
+            // Post-filter with regex and date range in memory
             let fts_result_count: usize = results.iter().map(|b| b.num_rows()).sum();
             tracing::info!(
                 "FTS returned {} candidates for field '{}'",
@@ -4534,35 +4789,44 @@ impl DatabaseManager {
             let regex = regex::RegexBuilder::new(&pattern)
                 .case_insensitive(true)
                 .build()?;
+            let has_date_filter = since.is_some() || until.is_some();
             let mut message_ids = HashSet::new();
-            let mut first_candidate_logged = false;
+            let mut bad_dates: usize = 0;
 
             for batch in &results {
-                let msg_array = batch
-                    .column(0)
-                    .as_any()
-                    .downcast_ref::<arrow::array::StringArray>()
-                    .unwrap();
-                let field_array = batch
-                    .column(2)
-                    .as_any()
-                    .downcast_ref::<arrow::array::StringArray>()
-                    .unwrap();
+                let msg_array: &arrow::array::StringArray = super::get_column(batch, "message_id")?;
+                let field_array: &arrow::array::StringArray =
+                    super::get_column(batch, &field_name)?;
+                let date_array: &arrow::array::StringArray = super::get_column(batch, "date")?;
 
                 for i in 0..batch.num_rows() {
-                    let field_value = field_array.value(i);
-
-                    // Log first candidate for debugging
-                    if !first_candidate_logged {
-                        tracing::info!("Sample {} value: '{}'", field_name, field_value);
-                        tracing::info!("Regex pattern: '{}'", pattern);
-                        first_candidate_logged = true;
+                    if !regex.is_match(field_array.value(i)) {
+                        continue;
                     }
-
-                    if regex.is_match(field_value) {
-                        message_ids.insert(msg_array.value(i).to_string());
+                    if has_date_filter {
+                        if let Ok(dt) = chrono::DateTime::parse_from_rfc2822(date_array.value(i)) {
+                            let dt_utc = dt.with_timezone(&chrono::Utc);
+                            if since.is_some_and(|s| dt_utc < s) {
+                                continue;
+                            }
+                            if until.is_some_and(|u| dt_utc > u) {
+                                continue;
+                            }
+                        } else {
+                            bad_dates += 1;
+                            continue;
+                        }
                     }
+                    message_ids.insert(msg_array.value(i).to_string());
                 }
+            }
+
+            if bad_dates > 0 {
+                tracing::warn!(
+                    "Skipped {} candidates with unparseable dates for field '{}'",
+                    bad_dates,
+                    field_name
+                );
             }
 
             tracing::info!(
@@ -4574,71 +4838,90 @@ impl DatabaseManager {
             Ok(message_ids)
         }
 
-        // Query from field
+        // Query from field (OR across patterns, then push single set)
         if let Some(patterns) = from_patterns {
             if !patterns.is_empty() {
-                // FTS: join patterns with spaces for multi-keyword search
-                let combined_pattern = patterns.join(" ");
-                let results = query_field_impl(
-                    &lore_table,
-                    "from".to_string(),
-                    combined_pattern,
-                    search_limit,
-                )
-                .await?;
-                tracing::info!("lore from field returned {} results", results.len());
-                field_result_sets.push(results);
+                let mut field_union = HashSet::new();
+                for pattern in patterns {
+                    let results = query_field_impl(
+                        &lore_table,
+                        "from".to_string(),
+                        pattern.clone(),
+                        search_limit,
+                        since_dt,
+                        until_dt,
+                    )
+                    .await?;
+                    field_union.extend(results);
+                }
+                tracing::info!("lore from field returned {} results", field_union.len());
+                field_result_sets.push(field_union);
             }
         }
 
-        // Query subject field
+        // Query subject field (OR across patterns)
         if let Some(patterns) = subject_patterns {
             if !patterns.is_empty() {
-                // FTS: join patterns with spaces for multi-keyword search
-                let combined_pattern = patterns.join(" ");
-                let results = query_field_impl(
-                    &lore_table,
-                    "subject".to_string(),
-                    combined_pattern,
-                    search_limit,
-                )
-                .await?;
-                tracing::info!("lore subject field returned {} results", results.len());
-                field_result_sets.push(results);
+                let mut field_union = HashSet::new();
+                for pattern in patterns {
+                    let results = query_field_impl(
+                        &lore_table,
+                        "subject".to_string(),
+                        pattern.clone(),
+                        search_limit,
+                        since_dt,
+                        until_dt,
+                    )
+                    .await?;
+                    field_union.extend(results);
+                }
+                tracing::info!("lore subject field returned {} results", field_union.len());
+                field_result_sets.push(field_union);
             }
         }
 
-        // Query body field
+        // Query body field (OR across patterns)
         if let Some(patterns) = body_patterns {
             if !patterns.is_empty() {
-                // FTS: join patterns with spaces for multi-keyword search
-                let combined_pattern = patterns.join(" ");
-                let results = query_field_impl(
-                    &lore_table,
-                    "body".to_string(),
-                    combined_pattern,
-                    search_limit,
-                )
-                .await?;
-                tracing::info!("lore body field returned {} results", results.len());
-                field_result_sets.push(results);
+                let mut field_union = HashSet::new();
+                for pattern in patterns {
+                    let results = query_field_impl(
+                        &lore_table,
+                        "body".to_string(),
+                        pattern.clone(),
+                        search_limit,
+                        since_dt,
+                        until_dt,
+                    )
+                    .await?;
+                    field_union.extend(results);
+                }
+                tracing::info!("lore body field returned {} results", field_union.len());
+                field_result_sets.push(field_union);
             }
         }
 
-        // Query recipients field
+        // Query recipients field (OR across patterns)
         if let Some(patterns) = recipients_patterns {
             if !patterns.is_empty() {
-                // FTS: join patterns with spaces for multi-keyword search
-                let combined_pattern = patterns.join(" ");
-                let results = query_field_impl(
-                    &lore_table,
-                    "recipients".to_string(),
-                    combined_pattern,
-                    search_limit,
-                )
-                .await?;
-                tracing::info!("lore recipients field returned {} results", results.len());
-                field_result_sets.push(results);
+                let mut field_union = HashSet::new();
+                for pattern in patterns {
+                    let results = query_field_impl(
+                        &lore_table,
+                        "recipients".to_string(),
+                        pattern.clone(),
+                        search_limit,
+                        since_dt,
+                        until_dt,
+                    )
+                    .await?;
+                    field_union.extend(results);
+                }
+                tracing::info!(
+                    "lore recipients field returned {} results",
+                    field_union.len()
+                );
+                field_result_sets.push(field_union);
             }
         }
 
@@ -4704,7 +4987,9 @@ impl DatabaseManager {
         let body_patterns = field_map.get("body").map(|v| v.as_slice());
         let recipients_patterns = field_map.get("recipients").map(|v| v.as_slice());
 
-        // Use helper to get intersection of message_ids
+        // Use helper to get intersection of message_ids.
+        // Date range is pushed into FTS queries so the candidate set
+        // is already bounded before intersection and fetching.
         let intersection = self
             .query_lore_by_fields_intersection(
                 from_patterns,
@@ -4712,6 +4997,8 @@ impl DatabaseManager {
                 body_patterns,
                 recipients_patterns,
                 0, // No limit for individual queries
+                since_date,
+                until_date,
             )
             .await?;
 
@@ -4721,54 +5008,15 @@ impl DatabaseManager {
             return Ok(Vec::new());
         }
 
-        // Parse filter dates to Unix timestamps for database-level filtering
-        let since_timestamp = since_date
-            .and_then(|d| chrono::DateTime::parse_from_rfc2822(d).ok())
-            .map(|dt| dt.timestamp());
-        let until_timestamp = until_date
-            .and_then(|d| chrono::DateTime::parse_from_rfc2822(d).ok())
-            .map(|dt| dt.timestamp());
+        // Fetch full email records for the intersection.
+        // Date filtering was already pushed into the per-field FTS
+        // queries, so the intersection is already date-bounded.
+        let count_limit = if limit > 0 { limit } else { intersection.len() };
+        let ids: Vec<&String> = intersection.iter().take(count_limit).collect();
+        let final_emails = self.fetch_lore_emails_by_message_ids(&ids).await?;
 
         tracing::info!(
-            "lore multi_field search: since_timestamp={:?} until_timestamp={:?}",
-            since_timestamp,
-            until_timestamp
-        );
-
-        // Build date filter clause — only if the column exists in the table
-        let has_date_timestamp = {
-            let table = self.connection.open_table("lore").execute().await?;
-            table
-                .schema()
-                .await
-                .map(|s| s.field_with_name("date_timestamp").is_ok())
-                .unwrap_or(false)
-        };
-        let date_filter = if has_date_timestamp {
-            match (since_timestamp, until_timestamp) {
-                (Some(since), Some(until)) => Some(format!(
-                    "date_timestamp >= {} AND date_timestamp <= {}",
-                    since, until
-                )),
-                (Some(since), None) => Some(format!("date_timestamp >= {}", since)),
-                (None, Some(until)) => Some(format!("date_timestamp <= {}", until)),
-                (None, None) => None,
-            }
-        } else {
-            None
-        };
-
-        // Fetch emails with date filtering at database level
-        let final_emails = self
-            .fetch_lore_emails_by_message_ids_with_filter(
-                &intersection,
-                date_filter.as_deref(),
-                limit,
-            )
-            .await?;
-
-        tracing::info!(
-            "Fetched {} email records matching date filter from {} message_ids",
+            "Fetched {} email records from {} message_ids",
             final_emails.len(),
             intersection.len()
         );
@@ -4776,13 +5024,13 @@ impl DatabaseManager {
         Ok(final_emails)
     }
 
-    /// Fetch lore emails by message IDs with optional SQL filter and limit
-    /// This allows efficient database-level filtering (e.g., by date_timestamp)
-    async fn fetch_lore_emails_by_message_ids_with_filter(
+    /// Fetch lore emails by message IDs in batches.
+    ///
+    /// Builds `message_id IN (...)` predicates in chunks to avoid
+    /// per-ID round-trips while keeping predicate size bounded.
+    async fn fetch_lore_emails_by_message_ids(
         &self,
-        message_ids: &std::collections::HashSet<String>,
-        filter: Option<&str>,
-        limit: usize,
+        message_ids: &[&String],
     ) -> Result<Vec<crate::types::LoreEmailInfo>> {
         use arrow::array::AsArray;
         use futures::TryStreamExt;
@@ -4792,88 +5040,99 @@ impl DatabaseManager {
         }
 
         let table = self.connection.open_table("lore").execute().await?;
+        let mut emails = Vec::with_capacity(message_ids.len());
 
-        // Build message_id IN clause
-        let escaped_ids: Vec<String> = message_ids
-            .iter()
-            .map(|id| {
-                let escaped = id.replace('\'', "''");
-                format!("'{}'", escaped)
-            })
-            .collect();
-        let in_clause = format!("message_id IN ({})", escaped_ids.join(", "));
+        for chunk in message_ids.chunks(500) {
+            let placeholders: Vec<String> = chunk
+                .iter()
+                .map(|id| {
+                    let escaped = id.replace('\'', "''");
+                    format!("'{}'", escaped)
+                })
+                .collect();
+            let predicate = format!("message_id IN ({})", placeholders.join(", "));
 
-        // Combine with optional filter
-        let where_clause = match filter {
-            Some(f) => format!("{} AND {}", in_clause, f),
-            None => in_clause,
-        };
+            let results = table
+                .query()
+                .only_if(&predicate)
+                .limit(chunk.len())
+                .execute()
+                .await?
+                .try_collect::<Vec<_>>()
+                .await?;
 
-        tracing::debug!("Lore query with filter: {}", where_clause);
+            for batch in &results {
+                let git_commit_shas = batch
+                    .column_by_name("git_commit_sha")
+                    .ok_or_else(|| anyhow::anyhow!("Missing git_commit_sha column"))?
+                    .as_string::<i32>();
+                let from_addrs = batch
+                    .column_by_name("from")
+                    .ok_or_else(|| anyhow::anyhow!("Missing from column"))?
+                    .as_string::<i32>();
+                let dates = batch
+                    .column_by_name("date")
+                    .ok_or_else(|| anyhow::anyhow!("Missing date column"))?
+                    .as_string::<i32>();
+                let date_timestamps = batch
+                    .column_by_name("date_timestamp")
+                    .and_then(|c| c.as_any().downcast_ref::<arrow::array::Int64Array>());
+                let msg_ids = batch
+                    .column_by_name("message_id")
+                    .ok_or_else(|| anyhow::anyhow!("Missing message_id column"))?
+                    .as_string::<i32>();
+                let in_reply_tos = batch
+                    .column_by_name("in_reply_to")
+                    .ok_or_else(|| anyhow::anyhow!("Missing in_reply_to column"))?
+                    .as_string::<i32>();
+                let subjects = batch
+                    .column_by_name("subject")
+                    .ok_or_else(|| anyhow::anyhow!("Missing subject column"))?
+                    .as_string::<i32>();
+                let references_list = batch
+                    .column_by_name("references")
+                    .ok_or_else(|| anyhow::anyhow!("Missing references column"))?
+                    .as_string::<i32>();
+                let recipients_list = batch
+                    .column_by_name("recipients")
+                    .ok_or_else(|| anyhow::anyhow!("Missing recipients column"))?
+                    .as_string::<i32>();
+                let bodies = batch
+                    .column_by_name("body")
+                    .ok_or_else(|| anyhow::anyhow!("Missing body column"))?
+                    .as_string::<i32>();
+                let symbols_list = batch
+                    .column_by_name("symbols")
+                    .ok_or_else(|| anyhow::anyhow!("Missing symbols column"))?
+                    .as_string::<i32>();
 
-        // Query with filter, ordered by date_timestamp descending (newest first)
-        let effective_limit = if limit > 0 { limit } else { message_ids.len() };
-        let results = table
-            .query()
-            .only_if(&where_clause)
-            .limit(effective_limit)
-            .execute()
-            .await?
-            .try_collect::<Vec<_>>()
-            .await?;
+                for i in 0..batch.num_rows() {
+                    let symbols_json = symbols_list.value(i);
+                    let symbols: Vec<String> =
+                        serde_json::from_str(symbols_json).unwrap_or_default();
 
-        let mut emails = Vec::new();
-        for batch in results {
-            let git_commit_sha_col = batch.column_by_name("git_commit_sha").unwrap();
-            let from_col = batch.column_by_name("from").unwrap();
-            let date_col = batch.column_by_name("date").unwrap();
-            let date_timestamp_col = batch.column_by_name("date_timestamp");
-            let message_id_col = batch.column_by_name("message_id").unwrap();
-            let in_reply_to_col = batch.column_by_name("in_reply_to").unwrap();
-            let subject_col = batch.column_by_name("subject").unwrap();
-            let references_col = batch.column_by_name("references").unwrap();
-            let recipients_col = batch.column_by_name("recipients").unwrap();
-            let body_col = batch.column_by_name("body").unwrap();
-            let symbols_col = batch.column_by_name("symbols").unwrap();
-
-            let git_commit_sha_arr = git_commit_sha_col.as_string::<i32>();
-            let from_arr = from_col.as_string::<i32>();
-            let date_arr = date_col.as_string::<i32>();
-            let date_timestamp_arr = date_timestamp_col
-                .and_then(|c| c.as_any().downcast_ref::<arrow::array::Int64Array>());
-            let message_id_arr = message_id_col.as_string::<i32>();
-            let in_reply_to_arr = in_reply_to_col.as_string::<i32>();
-            let subject_arr = subject_col.as_string::<i32>();
-            let references_arr = references_col.as_string::<i32>();
-            let recipients_arr = recipients_col.as_string::<i32>();
-            let body_arr = body_col.as_string::<i32>();
-            let symbols_arr = symbols_col.as_string::<i32>();
-
-            for i in 0..batch.num_rows() {
-                let symbols_json = symbols_arr.value(i);
-                let symbols: Vec<String> = serde_json::from_str(symbols_json).unwrap_or_default();
-
-                emails.push(crate::types::LoreEmailInfo {
-                    git_commit_sha: git_commit_sha_arr.value(i).to_string(),
-                    from: from_arr.value(i).to_string(),
-                    date: date_arr.value(i).to_string(),
-                    date_timestamp: Self::get_date_timestamp(date_timestamp_arr, date_arr, i),
-                    message_id: message_id_arr.value(i).to_string(),
-                    in_reply_to: if in_reply_to_arr.is_null(i) {
-                        None
-                    } else {
-                        Some(in_reply_to_arr.value(i).to_string())
-                    },
-                    subject: subject_arr.value(i).to_string(),
-                    references: if references_arr.is_null(i) {
-                        None
-                    } else {
-                        Some(references_arr.value(i).to_string())
-                    },
-                    recipients: recipients_arr.value(i).to_string(),
-                    body: body_arr.value(i).to_string(),
-                    symbols,
-                });
+                    emails.push(crate::types::LoreEmailInfo {
+                        git_commit_sha: git_commit_shas.value(i).to_string(),
+                        from: from_addrs.value(i).to_string(),
+                        date: dates.value(i).to_string(),
+                        date_timestamp: Self::get_date_timestamp(date_timestamps, dates, i),
+                        message_id: msg_ids.value(i).to_string(),
+                        in_reply_to: if in_reply_tos.is_null(i) {
+                            None
+                        } else {
+                            Some(in_reply_tos.value(i).to_string())
+                        },
+                        subject: subjects.value(i).to_string(),
+                        references: if references_list.is_null(i) {
+                            None
+                        } else {
+                            Some(references_list.value(i).to_string())
+                        },
+                        recipients: recipients_list.value(i).to_string(),
+                        body: bodies.value(i).to_string(),
+                        symbols,
+                    });
+                }
             }
         }
 
@@ -5779,5 +6038,55 @@ impl DatabaseManager {
         merge_insert.execute(Box::new(batch_iterator)).await?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::database::branches::{IndexedBranchInfo, IndexedBranchStore};
+    use arrow::array::RecordBatch;
+
+    #[tokio::test]
+    async fn test_garbage_collect_null_records_in_standalone_db() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let db_path = tmpdir.path().join("standalone.db");
+
+        let git_dir = tempfile::tempdir().unwrap();
+        let _ = std::process::Command::new("git")
+            .args(["init", git_dir.path().to_str().unwrap()])
+            .output();
+
+        let db = DatabaseManager::new(
+            db_path.to_str().unwrap(),
+            git_dir.path().to_str().unwrap().to_string(),
+        )
+        .await
+        .unwrap();
+
+        let schema = IndexedBranchStore::get_schema();
+        let empty_batch = RecordBatch::new_empty(schema);
+        db.connection()
+            .create_table("indexed_branches", vec![empty_batch])
+            .execute()
+            .await
+            .unwrap();
+
+        let store_local = IndexedBranchStore::new(
+            db.connection().clone(),
+            git_dir.path().to_str().unwrap().to_string(),
+            true,
+        );
+        let info_null = IndexedBranchInfo {
+            branch_name: "legacy".to_string(),
+            tip_commit: "sha1".to_string(),
+            indexed_at: 100,
+            remote: None,
+            repo_path: None,
+        };
+        store_local.record_branch_indexed(&info_null).await.unwrap();
+
+        let stats = db.garbage_collect().await.unwrap();
+        assert_eq!(stats.deleted_stale_branch_records, 1);
     }
 }

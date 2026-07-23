@@ -49,7 +49,7 @@ struct Args {
     database: Option<String>,
 
     /// Path to the git repository for git-aware queries
-    #[arg(long, default_value = ".")]
+    #[arg(long, env = "SEMCODE_GIT_REPO", default_value = ".")]
     git_repo: String,
 
     /// Path to local model directory (for semantic search)
@@ -553,4 +553,30 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+    use std::env;
+
+    // Combined into a single test so the three cases don't race on the
+    // process-wide SEMCODE_GIT_REPO env var when cargo runs tests in parallel.
+    #[test]
+    fn test_git_repo_arg_env_default() {
+        let key = "SEMCODE_GIT_REPO";
+
+        env::set_var(key, "/tmp/test_repo");
+        let args = Args::try_parse_from(["query"]).unwrap();
+        assert_eq!(args.git_repo, "/tmp/test_repo");
+
+        env::set_var(key, "/tmp/env_repo");
+        let args = Args::try_parse_from(["query", "--git-repo", "/tmp/arg_repo"]).unwrap();
+        assert_eq!(args.git_repo, "/tmp/arg_repo");
+
+        env::remove_var(key);
+        let args = Args::try_parse_from(["query"]).unwrap();
+        assert_eq!(args.git_repo, ".");
+    }
 }
