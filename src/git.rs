@@ -33,6 +33,21 @@ pub fn resolve_to_commit<'a>(repo: &'a gix::Repository, revspec: &str) -> Result
         .try_into_commit()
         .map_err(|_| anyhow::anyhow!("'{}' does not resolve to a commit", revspec))
 }
+
+/// Normalize path string to use forward slashes and trim `$HOME` prefix to `~` if applicable.
+pub fn normalize_repo_path<P: AsRef<Path>>(path: P) -> String {
+    let path = path.as_ref();
+    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let home = dirs::home_dir().map(|h| std::fs::canonicalize(&h).unwrap_or(h));
+
+    let path_buf = match home.as_ref().and_then(|h| canonical.strip_prefix(h).ok()) {
+        Some(rel) => PathBuf::from("~").join(rel),
+        None => canonical,
+    };
+
+    path_buf.to_string_lossy().replace('\\', "/")
+}
+
 use once_cell::sync::Lazy;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -222,6 +237,18 @@ pub fn get_git_file_hash_with_fallback<P: AsRef<Path>>(file_path: P) -> Result<S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_normalize_repo_path() {
+        let current_dir = std::env::current_dir().unwrap();
+        let normalized = normalize_repo_path(&current_dir);
+        assert!(!normalized.contains('\\'));
+        if let Some(home) = dirs::home_dir() {
+            if current_dir.starts_with(&home) {
+                assert!(normalized.starts_with("~"));
+            }
+        }
+    }
 
     #[test]
     fn test_get_git_sha_current_dir() {
