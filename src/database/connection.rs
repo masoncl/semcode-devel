@@ -29,8 +29,14 @@ use std::path::PathBuf;
 // Optimal batch size for LanceDB operations
 pub const OPTIMAL_BATCH_SIZE: usize = 65536;
 
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct GcStats {
+    pub deleted_stale_branch_records: usize,
+}
+
 pub struct DatabaseManager {
     connection: Connection,
+    db_path: String,
     work_dir: String,
     repo_identity: String,
     is_local_db: bool,
@@ -50,11 +56,11 @@ pub struct DatabaseManager {
 impl DatabaseManager {
     pub async fn new(db_path: &str, work_dir: String) -> Result<Self> {
         let connection = lancedb::connect(db_path).execute().await?;
-        let (repo_identity, is_local_db) =
-            crate::git::determine_db_locality(&work_dir, db_path);
+        let (repo_identity, is_local_db) = crate::git::determine_db_locality(&work_dir, db_path);
 
         Ok(Self {
             connection: connection.clone(),
+            db_path: db_path.to_string(),
             work_dir: work_dir.clone(),
             repo_identity: repo_identity.clone(),
             is_local_db,
@@ -2800,6 +2806,93 @@ impl DatabaseManager {
         self.branch_store.count().await
     }
 
+    /// Performs garbage collection on stale branch records belonging to deleted repository paths.
+    pub async fn garbage_collect(&self) -> Result<GcStats> {
+        let mut stats = GcStats::default();
+
+        let table = match self
+            .connection
+            .open_table("indexed_branches")
+            .execute()
+            .await
+        {
+            Ok(t) => t,
+            Err(_) => return Ok(stats),
+        };
+
+        use futures::TryStreamExt;
+        let results = table
+            .query()
+            .only_if("repo_path IS NOT NULL")
+            .execute()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        let mut known_repo_paths = HashSet::new();
+        for batch in &results {
+            if let Some(col) = batch.column_by_name("repo_path") {
+                if let Some(arr) = col.as_any().downcast_ref::<arrow::array::StringArray>() {
+                    for i in 0..batch.num_rows() {
+                        if !arr.is_null(i) {
+                            known_repo_paths.insert(arr.value(i).to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut repo_paths_to_clean = Vec::new();
+        for rp in known_repo_paths {
+            let expanded_path = if let Some(stripped) = rp.strip_prefix("~/") {
+                if let Some(home) = dirs::home_dir() {
+                    home.join(stripped)
+                } else {
+                    PathBuf::from(&rp)
+                }
+            } else {
+                PathBuf::from(&rp)
+            };
+
+            if !expanded_path.exists() {
+                repo_paths_to_clean.push(rp);
+            }
+        }
+
+        for stale_rp in repo_paths_to_clean {
+            let escaped = stale_rp.replace("'", "''");
+            let filter = format!("repo_path = '{escaped}'");
+            let _ = table.delete(&filter).await;
+            stats.deleted_stale_branch_records += 1;
+        }
+
+        // If the database directory does not reside within any Git repository,
+        // it is a standalone/central database that can never be local to any repository.
+        // In this case, un-scoped legacy (repo_path IS NULL) records can never be read
+        // and are safe to clean up.
+        let db_dir = std::path::Path::new(&self.db_path)
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."));
+        let is_inside_any_git_repo = gix::discover(db_dir).is_ok();
+
+        if !is_inside_any_git_repo {
+            let null_results = table
+                .query()
+                .only_if("repo_path IS NULL")
+                .execute()
+                .await?
+                .try_collect::<Vec<_>>()
+                .await?;
+            let null_count: usize = null_results.iter().map(|b| b.num_rows()).sum();
+            if null_count > 0 {
+                let _ = table.delete("repo_path IS NULL").await;
+                stats.deleted_stale_branch_records += null_count;
+            }
+        }
+
+        Ok(stats)
+    }
+
     // ==================== End Branch Management ====================
 
     pub async fn get_existing_function_names(&self) -> Result<std::collections::HashSet<String>> {
@@ -3454,16 +3547,12 @@ impl DatabaseManager {
         let mut manifest = std::collections::HashMap::new();
 
         // Use shared tree traversal utility
-        crate::git::walk_tree_at_commit(
-            &self.work_dir,
-            git_sha,
-            |relative_path, object_id| {
-                // Normalize path by removing any double slashes
-                let normalized_path = relative_path.replace("//", "/");
-                manifest.insert(normalized_path, object_id.to_string());
-                Ok(())
-            },
-        )?;
+        crate::git::walk_tree_at_commit(&self.work_dir, git_sha, |relative_path, object_id| {
+            // Normalize path by removing any double slashes
+            let normalized_path = relative_path.replace("//", "/");
+            manifest.insert(normalized_path, object_id.to_string());
+            Ok(())
+        })?;
 
         // Merge with workdir overlay (adds dirty files, removes deleted files)
         Ok(self.workdir_merged_manifest(manifest))
@@ -5949,5 +6038,55 @@ impl DatabaseManager {
         merge_insert.execute(Box::new(batch_iterator)).await?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::database::branches::{IndexedBranchInfo, IndexedBranchStore};
+    use arrow::array::RecordBatch;
+
+    #[tokio::test]
+    async fn test_garbage_collect_null_records_in_standalone_db() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let db_path = tmpdir.path().join("standalone.db");
+
+        let git_dir = tempfile::tempdir().unwrap();
+        let _ = std::process::Command::new("git")
+            .args(["init", git_dir.path().to_str().unwrap()])
+            .output();
+
+        let db = DatabaseManager::new(
+            db_path.to_str().unwrap(),
+            git_dir.path().to_str().unwrap().to_string(),
+        )
+        .await
+        .unwrap();
+
+        let schema = IndexedBranchStore::get_schema();
+        let empty_batch = RecordBatch::new_empty(schema);
+        db.connection()
+            .create_table("indexed_branches", vec![empty_batch])
+            .execute()
+            .await
+            .unwrap();
+
+        let store_local = IndexedBranchStore::new(
+            db.connection().clone(),
+            git_dir.path().to_str().unwrap().to_string(),
+            true,
+        );
+        let info_null = IndexedBranchInfo {
+            branch_name: "legacy".to_string(),
+            tip_commit: "sha1".to_string(),
+            indexed_at: 100,
+            remote: None,
+            repo_path: None,
+        };
+        store_local.record_branch_indexed(&info_null).await.unwrap();
+
+        let stats = db.garbage_collect().await.unwrap();
+        assert_eq!(stats.deleted_stale_branch_records, 1);
     }
 }

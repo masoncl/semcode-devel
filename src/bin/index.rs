@@ -1660,7 +1660,8 @@ async fn run_pipeline(args: Args) -> Result<()> {
         }
     }
 
-    // Optimization is now handled inside process_git_range for all modes
+    // Perform database garbage collection for stale branch records
+    let _ = db_manager.garbage_collect().await;
 
     // Drop and recreate if requested
     if args.drop_recreate {
