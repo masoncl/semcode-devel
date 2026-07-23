@@ -11,6 +11,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use futures::TryStreamExt;
 use lancedb::connection::Connection;
 use lancedb::query::{ExecutableQuery, QueryBase};
+use lancedb::index::{scalar::BTreeIndexBuilder, Index as LanceIndex};
 use std::sync::Arc;
 
 /// Information about an indexed branch
@@ -24,6 +25,8 @@ pub struct IndexedBranchInfo {
     pub indexed_at: i64,
     /// Remote name if this is a remote-tracking branch (e.g., "origin")
     pub remote: Option<String>,
+    /// Repository canonical path identity (NULL for local DB, canonical path for shared DB)
+    pub repo_path: Option<String>,
 }
 
 /// JSON-serializable version of IndexedBranchInfo
@@ -33,6 +36,7 @@ pub struct IndexedBranchInfoJson {
     pub tip_commit: String,
     pub indexed_at: i64,
     pub remote: Option<String>,
+    pub repo_path: Option<String>,
 }
 
 impl From<IndexedBranchInfo> for IndexedBranchInfoJson {
@@ -42,6 +46,7 @@ impl From<IndexedBranchInfo> for IndexedBranchInfoJson {
             tip_commit: info.tip_commit,
             indexed_at: info.indexed_at,
             remote: info.remote,
+            repo_path: info.repo_path,
         }
     }
 }
@@ -53,6 +58,7 @@ impl From<IndexedBranchInfoJson> for IndexedBranchInfo {
             tip_commit: json.tip_commit,
             indexed_at: json.indexed_at,
             remote: json.remote,
+            repo_path: json.repo_path,
         }
     }
 }
@@ -60,11 +66,64 @@ impl From<IndexedBranchInfoJson> for IndexedBranchInfo {
 /// Store for managing indexed branch records
 pub struct IndexedBranchStore {
     connection: Connection,
+    repo_identity: String,
+    is_local_db: bool,
 }
 
 impl IndexedBranchStore {
-    pub fn new(connection: Connection) -> Self {
-        Self { connection }
+    pub fn new(connection: Connection, repo_identity: String, is_local_db: bool) -> Self {
+        Self {
+            connection,
+            repo_identity,
+            is_local_db,
+        }
+    }
+
+    /// Construct SQL filter string for LanceDB queries based on repository identity and database locality.
+    /// Returns "true" (noop) if the table schema on disk does not have a repo_path column (legacy schema).
+    pub fn build_sql_filter(&self, schema: &Schema) -> String {
+        if schema.column_with_name("repo_path").is_none() {
+            return "true".to_string();
+        }
+        let escaped_rp = Self::escape_sql_literal(&self.repo_identity);
+        if self.is_local_db {
+            format!("(repo_path = '{escaped_rp}' OR repo_path IS NULL)")
+        } else {
+            format!("repo_path = '{escaped_rp}'")
+        }
+    }
+
+    async fn open_table_with_schema(&self) -> Result<(lancedb::Table, Arc<Schema>)> {
+        let table = self
+            .connection
+            .open_table("indexed_branches")
+            .execute()
+            .await?;
+        let schema = table.schema().await?;
+        Ok((table, schema))
+    }
+
+    async fn add_repo_path_column(&self, table: &lancedb::Table) -> Result<()> {
+        tracing::info!("Adding missing 'repo_path' column to indexed_branches table during write");
+        table
+            .add_columns(
+                lancedb::table::NewColumnTransform::SqlExpressions(vec![(
+                    "repo_path".into(),
+                    "CAST(NULL AS string)".into(),
+                )]),
+                None,
+            )
+            .await?;
+
+        let _ = table
+            .create_index(
+                &["repo_path"],
+                LanceIndex::BTree(BTreeIndexBuilder::default()),
+            )
+            .execute()
+            .await;
+
+        Ok(())
     }
 
     /// Get the Arrow schema for the indexed_branches table
@@ -74,25 +133,32 @@ impl IndexedBranchStore {
             Field::new("tip_commit", DataType::Utf8, false),
             Field::new("indexed_at", DataType::Int64, false),
             Field::new("remote", DataType::Utf8, true),
+            Field::new("repo_path", DataType::Utf8, true),
         ]))
+    }
+
+    fn escape_sql_literal(val: &str) -> String {
+        val.replace("'", "''")
     }
 
     /// Record that a branch has been indexed at a specific commit
     pub async fn record_branch_indexed(&self, info: &IndexedBranchInfo) -> Result<()> {
-        // First, remove any existing record for this branch
+        // First, remove any existing record for this branch under current repo scoping
         self.remove_branch(&info.branch_name).await?;
 
-        let table = self
-            .connection
-            .open_table("indexed_branches")
-            .execute()
-            .await?;
+        let (table, schema) = self.open_table_with_schema().await?;
+
+        // Migrate the schema to support scoping if writing to an older version
+        if schema.column_with_name("repo_path").is_none() {
+            self.add_repo_path_column(&table).await?;
+        }
 
         // Build arrays for each column
         let mut branch_name_builder = StringBuilder::new();
         let mut tip_commit_builder = StringBuilder::new();
         let mut indexed_at_builder = arrow::array::Int64Builder::new();
         let mut remote_builder = StringBuilder::new();
+        let mut repo_path_builder = StringBuilder::new();
 
         branch_name_builder.append_value(&info.branch_name);
         tip_commit_builder.append_value(&info.tip_commit);
@@ -100,6 +166,10 @@ impl IndexedBranchStore {
         match &info.remote {
             Some(r) => remote_builder.append_value(r),
             None => remote_builder.append_null(),
+        }
+        match &info.repo_path {
+            Some(rp) => repo_path_builder.append_value(rp),
+            None => repo_path_builder.append_null(),
         }
 
         let batch = RecordBatch::try_from_iter(vec![
@@ -116,6 +186,10 @@ impl IndexedBranchStore {
                 Arc::new(indexed_at_builder.finish()) as ArrayRef,
             ),
             ("remote", Arc::new(remote_builder.finish()) as ArrayRef),
+            (
+                "repo_path",
+                Arc::new(repo_path_builder.finish()) as ArrayRef,
+            ),
         ])?;
 
         table.add(vec![batch]).execute().await?;
@@ -131,45 +205,46 @@ impl IndexedBranchStore {
 
     /// Get full information about a specific branch
     pub async fn get_branch_info(&self, branch_name: &str) -> Result<Option<IndexedBranchInfo>> {
-        let table = self
-            .connection
-            .open_table("indexed_branches")
-            .execute()
-            .await?;
+        let (table, schema) = self.open_table_with_schema().await?;
 
-        let escaped_name = branch_name.replace("'", "''");
-        let filter = format!("branch_name = '{escaped_name}'");
+        let escaped_name = Self::escape_sql_literal(branch_name);
+        let repo_filter = self.build_sql_filter(&schema);
+        let sql_filter = format!("{repo_filter} AND branch_name = '{escaped_name}'");
 
         let results = table
             .query()
-            .only_if(filter)
-            .limit(1)
+            .only_if(sql_filter)
             .execute()
             .await?
             .try_collect::<Vec<_>>()
             .await?;
 
-        if results.is_empty() || results[0].num_rows() == 0 {
+        if results.is_empty() {
             return Ok(None);
         }
 
-        self.extract_record_from_batch(&results[0], 0)
+        // Disambiguate between legacy un-scoped (repo_path = NULL) and repo-scoped records
+        // by selecting the record with the most recent indexed_at timestamp.
+        let newest = results
+            .iter()
+            .flat_map(|batch| (0..batch.num_rows()).map(move |i| (batch, i)))
+            .map(|(batch, i)| self.extract_record_from_batch(batch, i))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
+            .max_by_key(|info| info.indexed_at);
+
+        Ok(newest)
     }
 
     /// List all indexed branches
     pub async fn list_indexed_branches(&self) -> Result<Vec<IndexedBranchInfo>> {
-        let table = self
-            .connection
-            .open_table("indexed_branches")
-            .execute()
-            .await?;
+        let (table, schema) = self.open_table_with_schema().await?;
 
-        let results = table
-            .query()
-            .execute()
-            .await?
-            .try_collect::<Vec<_>>()
-            .await?;
+        let sql_filter = self.build_sql_filter(&schema);
+        let query = table.query().only_if(sql_filter);
+
+        let results = query.execute().await?.try_collect::<Vec<_>>().await?;
 
         let mut branches = Vec::new();
         for batch in &results {
@@ -197,16 +272,13 @@ impl IndexedBranchStore {
 
     /// Remove a branch record (used when branch is deleted or before updating)
     pub async fn remove_branch(&self, branch_name: &str) -> Result<()> {
-        let table = self
-            .connection
-            .open_table("indexed_branches")
-            .execute()
-            .await?;
+        let (table, schema) = self.open_table_with_schema().await?;
 
-        let escaped_name = branch_name.replace("'", "''");
-        let filter = format!("branch_name = '{escaped_name}'");
+        let escaped_name = Self::escape_sql_literal(branch_name);
+        let repo_filter = self.build_sql_filter(&schema);
+        let sql_filter = format!("{repo_filter} AND branch_name = '{escaped_name}'");
 
-        table.delete(&filter).await?;
+        table.delete(&sql_filter).await?;
         Ok(())
     }
 
@@ -227,18 +299,15 @@ impl IndexedBranchStore {
 
     /// Get all branches that point to a specific commit
     pub async fn get_branches_at_commit(&self, commit_sha: &str) -> Result<Vec<IndexedBranchInfo>> {
-        let table = self
-            .connection
-            .open_table("indexed_branches")
-            .execute()
-            .await?;
+        let (table, schema) = self.open_table_with_schema().await?;
 
-        let escaped_sha = commit_sha.replace("'", "''");
-        let filter = format!("tip_commit = '{escaped_sha}'");
+        let escaped_sha = Self::escape_sql_literal(commit_sha);
+        let repo_filter = self.build_sql_filter(&schema);
+        let sql_filter = format!("{repo_filter} AND tip_commit = '{escaped_sha}'");
 
         let results = table
             .query()
-            .only_if(filter)
+            .only_if(sql_filter)
             .execute()
             .await?
             .try_collect::<Vec<_>>()
@@ -256,18 +325,14 @@ impl IndexedBranchStore {
         Ok(branches)
     }
 
-    /// Get total count of indexed branches
+    /// Get total count of indexed branches matching repository filter
     pub async fn count(&self) -> Result<usize> {
-        let table = self
-            .connection
-            .open_table("indexed_branches")
-            .execute()
-            .await?;
-        Ok(table.count_rows(None).await?)
+        let branches = self.list_indexed_branches().await?;
+        Ok(branches.len())
     }
 
     /// Extract an IndexedBranchInfo from a batch at the given row index
-    fn extract_record_from_batch(
+    pub fn extract_record_from_batch(
         &self,
         batch: &RecordBatch,
         row: usize,
@@ -300,6 +365,13 @@ impl IndexedBranchStore {
             .downcast_ref::<arrow::array::StringArray>()
             .ok_or_else(|| anyhow::anyhow!("Invalid remote column type"))?;
 
+        // Extract optional repo_path if column exists and value at row is non-null
+        let repo_path = batch
+            .column_by_name("repo_path")
+            .and_then(|col| col.as_any().downcast_ref::<arrow::array::StringArray>())
+            .filter(|arr| !arr.is_null(row))
+            .map(|arr| arr.value(row).to_string());
+
         let branch_name = branch_name_array.value(row).to_string();
         let tip_commit = tip_commit_array.value(row).to_string();
         let indexed_at = indexed_at_array.value(row);
@@ -314,6 +386,7 @@ impl IndexedBranchStore {
             tip_commit,
             indexed_at,
             remote,
+            repo_path,
         }))
     }
 }
@@ -337,7 +410,7 @@ mod tests {
             .await
             .unwrap();
 
-        let store = IndexedBranchStore::new(connection);
+        let store = IndexedBranchStore::new(connection, "~/projects/repoA/.git".to_string(), true);
         (tmpdir, store)
     }
 
@@ -350,6 +423,7 @@ mod tests {
             tip_commit: "abc123def456".to_string(),
             indexed_at: 1699900000,
             remote: None,
+            repo_path: None,
         };
 
         store.record_branch_indexed(&info).await.unwrap();
@@ -372,6 +446,7 @@ mod tests {
             tip_commit: "789abc123".to_string(),
             indexed_at: 1699900100,
             remote: Some("origin".to_string()),
+            repo_path: None,
         };
 
         store.record_branch_indexed(&info).await.unwrap();
@@ -392,6 +467,7 @@ mod tests {
             tip_commit: "commit1".to_string(),
             indexed_at: 1699900000,
             remote: None,
+            repo_path: None,
         };
         store.record_branch_indexed(&info1).await.unwrap();
 
@@ -401,6 +477,7 @@ mod tests {
             tip_commit: "commit2".to_string(),
             indexed_at: 1699900100,
             remote: None,
+            repo_path: None,
         };
         store.record_branch_indexed(&info2).await.unwrap();
 
@@ -423,18 +500,21 @@ mod tests {
                 tip_commit: "commit1".to_string(),
                 indexed_at: 1699900000,
                 remote: None,
+                repo_path: None,
             },
             IndexedBranchInfo {
                 branch_name: "develop".to_string(),
                 tip_commit: "commit2".to_string(),
                 indexed_at: 1699900100,
                 remote: None,
+                repo_path: None,
             },
             IndexedBranchInfo {
                 branch_name: "origin/feature".to_string(),
                 tip_commit: "commit3".to_string(),
                 indexed_at: 1699900200,
                 remote: Some("origin".to_string()),
+                repo_path: None,
             },
         ];
 
@@ -460,6 +540,7 @@ mod tests {
             tip_commit: "abc123".to_string(),
             indexed_at: 1699900000,
             remote: None,
+            repo_path: None,
         };
         store.record_branch_indexed(&info).await.unwrap();
 
@@ -480,6 +561,7 @@ mod tests {
             tip_commit: "abc123".to_string(),
             indexed_at: 1699900000,
             remote: None,
+            repo_path: None,
         };
         store.record_branch_indexed(&info).await.unwrap();
 
@@ -500,24 +582,28 @@ mod tests {
                 tip_commit: "commit1".to_string(),
                 indexed_at: 1699900000,
                 remote: None,
+                repo_path: None,
             },
             IndexedBranchInfo {
                 branch_name: "origin/main".to_string(),
                 tip_commit: "commit2".to_string(),
                 indexed_at: 1699900100,
                 remote: Some("origin".to_string()),
+                repo_path: None,
             },
             IndexedBranchInfo {
                 branch_name: "origin/develop".to_string(),
                 tip_commit: "commit3".to_string(),
                 indexed_at: 1699900200,
                 remote: Some("origin".to_string()),
+                repo_path: None,
             },
             IndexedBranchInfo {
                 branch_name: "upstream/main".to_string(),
                 tip_commit: "commit4".to_string(),
                 indexed_at: 1699900300,
                 remote: Some("upstream".to_string()),
+                repo_path: None,
             },
         ];
 
@@ -545,18 +631,21 @@ mod tests {
                 tip_commit: shared_commit.to_string(),
                 indexed_at: 1699900000,
                 remote: None,
+                repo_path: None,
             },
             IndexedBranchInfo {
                 branch_name: "release".to_string(),
                 tip_commit: shared_commit.to_string(),
                 indexed_at: 1699900100,
                 remote: None,
+                repo_path: None,
             },
             IndexedBranchInfo {
                 branch_name: "develop".to_string(),
                 tip_commit: "different456".to_string(),
                 indexed_at: 1699900200,
                 remote: None,
+                repo_path: None,
             },
         ];
 
@@ -579,6 +668,7 @@ mod tests {
             tip_commit: "abc123".to_string(),
             indexed_at: 1699900000,
             remote: None,
+            repo_path: None,
         };
         store.record_branch_indexed(&info).await.unwrap();
 
@@ -599,6 +689,7 @@ mod tests {
             tip_commit: "abc123".to_string(),
             indexed_at: 1699900000,
             remote: None,
+            repo_path: None,
         };
         store.record_branch_indexed(&info).await.unwrap();
 
@@ -608,5 +699,154 @@ mod tests {
             .unwrap();
         assert!(retrieved.is_some());
         assert_eq!(retrieved.unwrap().branch_name, "feature/user's-branch");
+    }
+
+    #[tokio::test]
+    async fn test_shared_db_branch_isolation() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let connection = lancedb::connect(tmpdir.path().to_str().unwrap())
+            .execute()
+            .await
+            .unwrap();
+
+        let schema = IndexedBranchStore::get_schema();
+        let empty_batch = RecordBatch::new_empty(schema.clone());
+        connection
+            .create_table("indexed_branches", vec![empty_batch])
+            .execute()
+            .await
+            .unwrap();
+
+        let repo_a = "~/projects/repoA/.git";
+        let repo_b = "~/projects/repoB/.git";
+
+        let store_a = IndexedBranchStore::new(connection.clone(), repo_a.to_string(), false);
+        let store_b = IndexedBranchStore::new(connection.clone(), repo_b.to_string(), false);
+
+        let info_a = IndexedBranchInfo {
+            branch_name: "main".to_string(),
+            tip_commit: "commit_a_123".to_string(),
+            indexed_at: 1699900000,
+            remote: None,
+            repo_path: Some(repo_a.to_string()),
+        };
+        store_a.record_branch_indexed(&info_a).await.unwrap();
+
+        let info_b = IndexedBranchInfo {
+            branch_name: "main".to_string(),
+            tip_commit: "commit_b_456".to_string(),
+            indexed_at: 1699900100,
+            remote: None,
+            repo_path: Some(repo_b.to_string()),
+        };
+        store_b.record_branch_indexed(&info_b).await.unwrap();
+
+        // In shared mode, store A sees only repo A's main branch
+        let branch_a = store_a.get_branch_info("main").await.unwrap().unwrap();
+        assert_eq!(branch_a.tip_commit, "commit_a_123");
+
+        // Store B sees only repo B's main branch
+        let branch_b = store_b.get_branch_info("main").await.unwrap().unwrap();
+        assert_eq!(branch_b.tip_commit, "commit_b_456");
+
+        // Listing for Store A yields 1 branch
+        let list_a = store_a.list_indexed_branches().await.unwrap();
+        assert_eq!(list_a.len(), 1);
+        assert_eq!(list_a[0].tip_commit, "commit_a_123");
+    }
+
+    #[tokio::test]
+    async fn test_local_db_matches_null_and_active() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let connection = lancedb::connect(tmpdir.path().to_str().unwrap())
+            .execute()
+            .await
+            .unwrap();
+
+        let schema = IndexedBranchStore::get_schema();
+        let empty_batch = RecordBatch::new_empty(schema.clone());
+        connection
+            .create_table("indexed_branches", vec![empty_batch])
+            .execute()
+            .await
+            .unwrap();
+
+        let repo_a = "~/projects/repoA/.git";
+
+        let store_local = IndexedBranchStore::new(connection.clone(), repo_a.to_string(), true);
+        let store_shared = IndexedBranchStore::new(connection.clone(), repo_a.to_string(), false);
+
+        // Record a legacy NULL branch entry
+        let info_null = IndexedBranchInfo {
+            branch_name: "legacy_branch".to_string(),
+            tip_commit: "legacy_sha".to_string(),
+            indexed_at: 1699900000,
+            remote: None,
+            repo_path: None,
+        };
+        store_local.record_branch_indexed(&info_null).await.unwrap();
+
+        // In Local mode, the legacy NULL branch is returned
+        let branch = store_local
+            .get_branch_info("legacy_branch")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(branch.tip_commit, "legacy_sha");
+
+        // In Shared mode, the legacy NULL branch is NOT returned
+        let branch_shared = store_shared.get_branch_info("legacy_branch").await.unwrap();
+        assert!(branch_shared.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_read_old_indexed_branches_table_does_not_alter_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().to_str().unwrap();
+
+        // 1. Manually create an old 4-column indexed_branches table FIRST
+        let connection = lancedb::connect(db_path).execute().await.unwrap();
+        let old_schema = Arc::new(Schema::new(vec![
+            Field::new("branch_name", DataType::Utf8, false),
+            Field::new("tip_commit", DataType::Utf8, false),
+            Field::new("indexed_at", DataType::Int64, false),
+            Field::new("remote", DataType::Utf8, true),
+        ]));
+
+        let empty_batch = RecordBatch::new_empty(old_schema);
+        connection
+            .create_table("indexed_branches", vec![empty_batch])
+            .execute()
+            .await
+            .unwrap();
+
+        // 2. NOW open IndexedBranchStore on the old schema
+        let store = IndexedBranchStore::new(connection, "~/projects/repoA/.git".to_string(), true);
+
+        // Reading branches works cleanly without altering disk schema
+        let (_table, schema_read) = store.open_table_with_schema().await.unwrap();
+        assert!(
+            schema_read.column_with_name("repo_path").is_none(),
+            "Read-only operations should not alter schema on disk"
+        );
+
+        let branches = store.list_indexed_branches().await.unwrap();
+        assert!(branches.is_empty());
+
+        // Writing a new branch record triggers schema migration on demand
+        let info = IndexedBranchInfo {
+            branch_name: "main".to_string(),
+            tip_commit: "sha123".to_string(),
+            indexed_at: 1699900000,
+            remote: None,
+            repo_path: None,
+        };
+        store.record_branch_indexed(&info).await.unwrap();
+
+        let (_table, schema_after_write) = store.open_table_with_schema().await.unwrap();
+        assert!(
+            schema_after_write.column_with_name("repo_path").is_some(),
+            "Write operation should add repo_path column on demand"
+        );
     }
 }

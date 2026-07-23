@@ -24,13 +24,16 @@ use crate::types::{FunctionInfo, TypeInfo, TypedefInfo};
 use crate::vectorizer::CodeVectorizer;
 use crate::workdir::WorkdirIndex;
 use std::collections::HashSet;
+use std::path::PathBuf;
 
 // Optimal batch size for LanceDB operations
 pub const OPTIMAL_BATCH_SIZE: usize = 65536;
 
 pub struct DatabaseManager {
     connection: Connection,
-    git_repo_path: String,
+    work_dir: String,
+    repo_identity: String,
+    is_local_db: bool,
     function_store: FunctionStore,
     type_store: TypeStore,
     typedef_store: TypedefStore,
@@ -45,22 +48,26 @@ pub struct DatabaseManager {
 }
 
 impl DatabaseManager {
-    pub async fn new(db_path: &str, git_repo_path: String) -> Result<Self> {
+    pub async fn new(db_path: &str, work_dir: String) -> Result<Self> {
         let connection = lancedb::connect(db_path).execute().await?;
+        let (repo_identity, is_local_db) =
+            crate::git::determine_db_locality(&work_dir, db_path);
 
         Ok(Self {
             connection: connection.clone(),
-            git_repo_path: git_repo_path.clone(),
+            work_dir: work_dir.clone(),
+            repo_identity: repo_identity.clone(),
+            is_local_db,
             function_store: FunctionStore::new(connection.clone()),
             type_store: TypeStore::new(connection.clone()),
             typedef_store: TypedefStore::new(connection.clone()),
-            search_manager: SearchManager::new(connection.clone(), git_repo_path),
+            search_manager: SearchManager::new(connection.clone(), work_dir),
             vector_search_manager: VectorSearchManager::new(connection.clone()),
             schema_manager: SchemaManager::new(connection.clone()),
             processed_file_store: ProcessedFileStore::new(connection.clone()),
             content_store: ContentStore::new(connection.clone()),
             symbol_filename_store: SymbolFilenameStore::new(connection.clone()),
-            branch_store: IndexedBranchStore::new(connection.clone()),
+            branch_store: IndexedBranchStore::new(connection.clone(), repo_identity, is_local_db),
             workdir_index: std::sync::RwLock::new(None),
         })
     }
@@ -2606,14 +2613,14 @@ impl DatabaseManager {
         file_paths: &[String],
         git_sha: &str,
     ) -> Result<std::collections::HashMap<String, String>> {
-        match crate::git::resolve_files_at_commit(&self.git_repo_path, git_sha, file_paths) {
+        match crate::git::resolve_files_at_commit(&self.work_dir, git_sha, file_paths) {
             Ok(resolved_hashes) => {
                 // If no files were resolved, log this as a warning
                 if resolved_hashes.is_empty() {
                     tracing::warn!(
                         "No files were resolved at commit {} in repository {}",
                         git_sha,
-                        self.git_repo_path
+                        self.work_dir
                     );
                 }
 
@@ -2621,7 +2628,7 @@ impl DatabaseManager {
             }
             Err(e) => {
                 tracing::error!("DatabaseManager::resolve_git_file_hashes: Failed to resolve git files at commit {}: {}", git_sha, e);
-                tracing::error!("Repository path: {}", self.git_repo_path);
+                tracing::error!("Repository path: {}", self.work_dir);
                 tracing::error!("Requested file paths: {:?}", file_paths);
                 Ok(std::collections::HashMap::new()) // Return empty map instead of failing, let caller handle
             }
@@ -2713,6 +2720,14 @@ impl DatabaseManager {
 
     // ==================== Branch Management ====================
 
+    pub fn repo_identity(&self) -> &str {
+        &self.repo_identity
+    }
+
+    pub fn is_local_db(&self) -> bool {
+        self.is_local_db
+    }
+
     /// Record that a branch has been indexed at a specific commit
     pub async fn record_branch_indexed(
         &self,
@@ -2721,6 +2736,7 @@ impl DatabaseManager {
         remote: Option<&str>,
     ) -> Result<()> {
         use crate::database::branches::IndexedBranchInfo;
+        let repo_path = (!self.is_local_db).then(|| self.repo_identity.clone());
         let info = IndexedBranchInfo {
             branch_name: branch_name.to_string(),
             tip_commit: tip_commit.to_string(),
@@ -2729,6 +2745,7 @@ impl DatabaseManager {
                 .unwrap()
                 .as_secs() as i64,
             remote: remote.map(|s| s.to_string()),
+            repo_path,
         };
         self.branch_store.record_branch_indexed(&info).await
     }
@@ -2840,7 +2857,7 @@ impl DatabaseManager {
         );
 
         // Step 1: Get directly changed files between commits
-        let changed_files = get_changed_files(&self.git_repo_path, commit_a, commit_b)?;
+        let changed_files = get_changed_files(&self.work_dir, commit_a, commit_b)?;
         let mut files_to_scan = std::collections::HashSet::new();
 
         // Add all directly changed files (except deleted ones)
@@ -3302,7 +3319,7 @@ impl DatabaseManager {
             }
             None => {
                 // Default to current commit
-                match crate::git::get_git_sha(&self.git_repo_path) {
+                match crate::git::get_git_sha(&self.work_dir) {
                     Ok(Some(current_sha)) => {
                         tracing::info!("Using current git commit SHA: {}", current_sha);
                         current_sha
@@ -3438,7 +3455,7 @@ impl DatabaseManager {
 
         // Use shared tree traversal utility
         crate::git::walk_tree_at_commit(
-            &self.git_repo_path,
+            &self.work_dir,
             git_sha,
             |relative_path, object_id| {
                 // Normalize path by removing any double slashes

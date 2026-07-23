@@ -34,16 +34,16 @@ pub struct FunctionMatch {
 
 pub struct SearchManager {
     connection: Connection,
-    git_repo_path: String,
+    work_dir: String,
     content_store: ContentStore,
 }
 
 impl SearchManager {
-    pub fn new(connection: Connection, git_repo_path: String) -> Self {
+    pub fn new(connection: Connection, work_dir: String) -> Self {
         let content_store = ContentStore::new(connection.clone());
         Self {
             connection,
-            git_repo_path,
+            work_dir,
             content_store,
         }
     }
@@ -62,7 +62,7 @@ impl SearchManager {
             git_sha
         );
 
-        match crate::git::resolve_files_at_commit(&self.git_repo_path, git_sha, file_paths) {
+        match crate::git::resolve_files_at_commit(&self.work_dir, git_sha, file_paths) {
             Ok(resolved_hashes) => {
                 tracing::debug!(
                     "resolve_git_file_hashes: Successfully resolved {} out of {} file paths",
