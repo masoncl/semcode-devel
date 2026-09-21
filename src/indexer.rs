@@ -405,22 +405,20 @@ pub fn parse_email_from_commit(
     repo: &gix::Repository,
     commit_sha: &str,
 ) -> Result<crate::LoreEmailInfo> {
-    // Resolve commit
-    let commit = resolve_to_commit(repo, commit_sha)?;
+    match parse_lore_commit_entry(repo, commit_sha)? {
+        LoreCommitParseOutcome::Email(info) => Ok(*info),
+        LoreCommitParseOutcome::NoEmailFile(_) => Err(anyhow::anyhow!(
+            "Commit {} does not contain file 'm'",
+            commit_sha
+        )),
+    }
+}
 
-    // Get the tree
-    let tree = commit.tree()?;
-
-    // Find the 'm' file in the tree
-    let m_entry = tree
-        .find_entry("m")
-        .ok_or_else(|| anyhow::anyhow!("Commit {} does not contain file 'm'", commit_sha))?;
-
-    // Read the file content
-    let object = m_entry.object()?;
-    let blob = object.try_into_blob()?;
-    let email_content = String::from_utf8_lossy(blob.data.as_slice()).to_string();
-
+/// Parse email headers and body from raw `'m'` blob contents
+fn parse_email_from_blob_content(
+    commit_sha: &str,
+    email_content: &str,
+) -> Result<crate::LoreEmailInfo> {
     // Parse email headers
     let mut headers = EmailHeaders::new();
 
@@ -809,8 +807,44 @@ pub async fn process_commits_pipeline(
     Ok(())
 }
 
-/// Process lore commits using a streaming pipeline
-/// Similar to process_commits_pipeline but parses email from 'm' file
+/// Result of parsing a single commit in a lore git repository.
+enum LoreCommitParseOutcome {
+    /// Normal commit containing an `'m'` email file.
+    Email(Box<crate::LoreEmailInfo>),
+    /// Administrative commit without an `'m'` file (e.g. a `public-inbox` `"rm"`
+    /// deletion commit containing `'d'`). Its SHA should still be recorded in
+    /// `lore_indexed_commits` so it is not re-processed on every subsequent run.
+    NoEmailFile(String),
+}
+
+/// Parse a lore commit into either an email (`'m'` file) or `NoEmailFile` if the
+/// commit tree has no `'m'` entry (such as a `public-inbox` `"rm"` commit).
+fn parse_lore_commit_entry(
+    repo: &gix::Repository,
+    commit_sha: &str,
+) -> Result<LoreCommitParseOutcome> {
+    let commit = resolve_to_commit(repo, commit_sha)?;
+    let tree = commit.tree()?;
+    let Some(m_entry) = tree.find_entry("m") else {
+        debug!(
+            "Commit {} has no 'm' file (likely a public-inbox 'rm' commit); marking as indexed",
+            commit_sha
+        );
+        return Ok(LoreCommitParseOutcome::NoEmailFile(commit_sha.to_string()));
+    };
+
+    let object = m_entry.object()?;
+    let blob = object.try_into_blob()?;
+    let email_content = String::from_utf8_lossy(blob.data.as_slice());
+    parse_email_from_blob_content(commit_sha, &email_content)
+        .map(|info| LoreCommitParseOutcome::Email(Box::new(info)))
+}
+
+/// Process lore commits using a streaming pipeline.
+/// Similar to process_commits_pipeline but parses email from 'm' file.
+/// Returns `(inserted_emails, recorded_commits)` where `recorded_commits`
+/// includes both stored email commits and administrative (`rm`) commits
+/// recorded in `lore_indexed_commits`.
 pub async fn process_lore_commits_pipeline(
     repo_path: &std::path::Path,
     commit_shas: Vec<String>,
@@ -818,9 +852,15 @@ pub async fn process_lore_commits_pipeline(
     batch_size: usize,
     num_workers: usize,
     num_inserters: usize,
-) -> Result<()> {
+) -> Result<(usize, usize)> {
     use indicatif::{ProgressBar, ProgressStyle};
     use std::sync::Mutex;
+
+    // Cap git worker threads so we don't open 100+ separate gix::Repository
+    // packfile mmaps/caches on high-core-count machines.
+    let batch_size = batch_size.max(1);
+    let num_workers = num_workers.clamp(1, 16);
+    let num_inserters = num_inserters.max(1);
 
     // Create progress bar
     let pb = ProgressBar::new(commit_shas.len() as u64);
@@ -832,9 +872,15 @@ pub async fn process_lore_commits_pipeline(
         .progress_chars("█▓▒░  ")
     );
 
-    // Create channels for streaming
+    // Workers send individual parsed items into a bounded channel (`batch_size * 2`),
+    // and a single collector thread assembles full `batch_size` batches for the
+    // database inserters. This prevents `num_workers` threads from each hoarding
+    // up to `batch_size` emails in RAM simultaneously (`num_workers * batch_size`
+    // emails) and flushing `num_workers` fragmented batches when `commit_tx` closes.
     let (commit_tx, commit_rx) = mpsc::channel::<String>();
-    let (result_tx, result_rx) = mpsc::sync_channel::<Vec<crate::LoreEmailInfo>>(10);
+    let (item_tx, item_rx) = mpsc::sync_channel::<LoreCommitParseOutcome>(batch_size * 2);
+    let (result_tx, result_rx) =
+        tokio::sync::mpsc::channel::<(Vec<crate::LoreEmailInfo>, Vec<String>)>(4);
 
     // Wrap receiver for shared access
     let shared_commit_rx = Arc::new(Mutex::new(commit_rx));
@@ -842,6 +888,7 @@ pub async fn process_lore_commits_pipeline(
     // Shared counters
     let processed_count = Arc::new(AtomicUsize::new(0));
     let inserted_count = Arc::new(AtomicUsize::new(0));
+    let recorded_commits_count = Arc::new(AtomicUsize::new(0));
 
     // Spawn progress updater thread
     let pb_clone = pb.clone();
@@ -859,7 +906,7 @@ pub async fn process_lore_commits_pipeline(
     let mut worker_handles = Vec::new();
     for worker_id in 0..num_workers {
         let worker_commit_rx = shared_commit_rx.clone();
-        let worker_result_tx = result_tx.clone();
+        let worker_item_tx = item_tx.clone();
         let worker_repo_path = repo_path.to_path_buf();
         let worker_processed = processed_count.clone();
 
@@ -873,10 +920,7 @@ pub async fn process_lore_commits_pipeline(
                 }
             };
 
-            let mut batch = Vec::new();
-
             loop {
-                // Get next commit SHA
                 let commit_sha = {
                     match worker_commit_rx.lock() {
                         Ok(rx) => rx.recv(),
@@ -889,17 +933,11 @@ pub async fn process_lore_commits_pipeline(
 
                 match commit_sha {
                     Ok(sha) => {
-                        match parse_email_from_commit(&thread_repo, &sha) {
-                            Ok(email_info) => {
-                                batch.push(email_info);
+                        match parse_lore_commit_entry(&thread_repo, &sha) {
+                            Ok(outcome) => {
                                 worker_processed.fetch_add(1, Ordering::Relaxed);
-
-                                // Send batch when it reaches batch_size
-                                if batch.len() >= batch_size {
-                                    if worker_result_tx.send(batch.clone()).is_err() {
-                                        break;
-                                    }
-                                    batch.clear();
+                                if worker_item_tx.send(outcome).is_err() {
+                                    break;
                                 }
                             }
                             Err(e) => {
@@ -911,18 +949,47 @@ pub async fn process_lore_commits_pipeline(
                             }
                         }
                     }
-                    Err(_) => {
-                        // Channel closed, send remaining batch
-                        if !batch.is_empty() {
-                            let _ = worker_result_tx.send(batch);
-                        }
-                        break;
-                    }
+                    Err(_) => break,
                 }
             }
         });
         worker_handles.push(handle);
     }
+
+    drop(shared_commit_rx);
+    drop(item_tx);
+
+    // Single batch-collector thread to assemble uniform `batch_size` batches
+    let collector_handle = thread::spawn(move || {
+        let mut emails_batch = Vec::with_capacity(batch_size);
+        let mut non_email_shas = Vec::new();
+
+        for outcome in item_rx {
+            match outcome {
+                LoreCommitParseOutcome::Email(email_info) => {
+                    emails_batch.push(*email_info);
+                }
+                LoreCommitParseOutcome::NoEmailFile(sha) => {
+                    non_email_shas.push(sha);
+                }
+            }
+
+            if emails_batch.len() + non_email_shas.len() >= batch_size {
+                let send_emails = std::mem::replace(
+                    &mut emails_batch,
+                    Vec::with_capacity(batch_size),
+                );
+                let send_non_email = std::mem::take(&mut non_email_shas);
+                if result_tx.blocking_send((send_emails, send_non_email)).is_err() {
+                    return;
+                }
+            }
+        }
+
+        if !emails_batch.is_empty() || !non_email_shas.is_empty() {
+            let _ = result_tx.blocking_send((emails_batch, non_email_shas));
+        }
+    });
 
     // Spawn producer thread to feed commit SHAs
     let producer_handle = thread::spawn(move || {
@@ -933,11 +1000,8 @@ pub async fn process_lore_commits_pipeline(
         }
     });
 
-    // Close original senders
-    drop(result_tx);
-
-    // Wrap result receiver for shared access
-    let shared_result_rx = Arc::new(Mutex::new(result_rx));
+    // Wrap async result receiver for shared access across inserter tasks
+    let shared_result_rx = Arc::new(tokio::sync::Mutex::new(result_rx));
 
     // Shared flag to coordinate periodic optimization checks
     // Only one inserter should check at a time to avoid redundant checks
@@ -950,6 +1014,7 @@ pub async fn process_lore_commits_pipeline(
     for inserter_id in 0..num_inserters {
         let db_manager_clone = Arc::clone(&db_manager);
         let inserted_clone = inserted_count.clone();
+        let recorded_clone = recorded_commits_count.clone();
         let pb_clone = pb.clone();
         let result_rx_clone = shared_result_rx.clone();
         let batches_counter = batches_inserted.clone();
@@ -957,58 +1022,64 @@ pub async fn process_lore_commits_pipeline(
 
         let handle = tokio::spawn(async move {
             loop {
-                // Get next batch from shared receiver
+                // Get next batch from shared async receiver without blocking Tokio threads
                 let batch = {
-                    match result_rx_clone.lock() {
-                        Ok(rx) => rx.recv(),
-                        Err(e) => {
-                            error!("Inserter {} failed to lock receiver: {}", inserter_id, e);
-                            break;
-                        }
-                    }
+                    let mut rx = result_rx_clone.lock().await;
+                    rx.recv().await
                 };
 
                 match batch {
-                    Ok(emails) => {
+                    Some((emails, non_email_shas)) => {
                         // Insert batch into database
                         match db_manager_clone.insert_lore_emails(&emails).await {
                             Err(e) => {
                                 error!("Inserter {} failed to insert batch: {}", inserter_id, e);
                             }
                             Ok(failed_indices) => {
-                                let failed_set: std::collections::HashSet<usize> =
-                                    failed_indices.into_iter().collect();
-                                let success_count = emails.len() - failed_set.len();
-
-                                // Record commit SHAs only for emails that
-                                // were actually stored, so that failed
-                                // emails are retried on the next run.
-                                let shas: Vec<String> = emails
+                                let failed_msg_ids: std::collections::HashSet<&str> =
+                                    failed_indices
+                                        .iter()
+                                        .map(|&idx| emails[idx].message_id.as_str())
+                                        .collect();
+                                let success_count = emails
                                     .iter()
-                                    .enumerate()
-                                    .filter(|(i, _)| !failed_set.contains(i))
-                                    .map(|(_, e)| e.git_commit_sha.as_str())
-                                    .collect::<std::collections::HashSet<_>>()
-                                    .into_iter()
-                                    .map(String::from)
+                                    .filter(|e| !failed_msg_ids.contains(e.message_id.as_str()))
+                                    .count();
+
+                                // Record commit SHAs for emails that were stored plus
+                                // any administrative (`rm`) commits without an `'m'` file.
+                                let mut shas_set: std::collections::HashSet<String> = emails
+                                    .iter()
+                                    .filter(|e| !failed_msg_ids.contains(e.message_id.as_str()))
+                                    .map(|e| e.git_commit_sha.clone())
                                     .collect();
+                                for sha in &non_email_shas {
+                                    shas_set.insert(sha.clone());
+                                }
+                                let shas: Vec<String> = shas_set.into_iter().collect();
+                                let recorded_in_batch = shas.len();
+
                                 if !shas.is_empty() {
-                                    if let Err(e) =
-                                        db_manager_clone.insert_lore_indexed_commits(&shas).await
+                                    match db_manager_clone.insert_lore_indexed_commits(&shas).await
                                     {
-                                        error!(
-                                            "Inserter {} failed to record indexed commits: {}",
-                                            inserter_id, e
-                                        );
+                                        Ok(()) => {
+                                            let count = inserted_clone
+                                                .fetch_add(success_count, Ordering::Relaxed);
+                                            recorded_clone
+                                                .fetch_add(recorded_in_batch, Ordering::Relaxed);
+                                            pb_clone.set_message(format!(
+                                                "Inserted {} emails",
+                                                count + success_count
+                                            ));
+                                        }
+                                        Err(e) => {
+                                            error!(
+                                                "Inserter {} failed to record indexed commits: {}",
+                                                inserter_id, e
+                                            );
+                                        }
                                     }
                                 }
-
-                                let count =
-                                    inserted_clone.fetch_add(success_count, Ordering::Relaxed);
-                                pb_clone.set_message(format!(
-                                    "Inserted {} emails",
-                                    count + success_count
-                                ));
 
                                 // Track successful batch insertions and check for periodic optimization
                                 let total_batches =
@@ -1023,7 +1094,7 @@ pub async fn process_lore_commits_pipeline(
                             }
                         }
                     }
-                    Err(_) => {
+                    None => {
                         // Channel closed
                         break;
                     }
@@ -1033,29 +1104,36 @@ pub async fn process_lore_commits_pipeline(
         inserter_handles.push(handle);
     }
 
-    // Wait for all workers to finish
-    for handle in worker_handles {
-        let _ = handle.join();
-    }
+    drop(shared_result_rx);
 
-    // Wait for producer
-    let _ = producer_handle.join();
+    // Join OS worker, collector, and producer threads on the blocking pool
+    // so Tokio runtime threads remain free to drive the inserter futures.
+    let _ = tokio::task::spawn_blocking(move || {
+        for handle in worker_handles {
+            let _ = handle.join();
+        }
+        let _ = collector_handle.join();
+        let _ = producer_handle.join();
+    })
+    .await;
 
     // Wait for all inserters to finish
     for handle in inserter_handles {
         let _ = handle.await;
     }
 
+    let final_inserted = inserted_count.load(Ordering::Relaxed);
+    let final_recorded = recorded_commits_count.load(Ordering::Relaxed);
     pb.finish_with_message(format!(
-        "Processed {} emails, inserted {}",
+        "Processed {} commits, inserted {} emails",
         processed_count.load(Ordering::Relaxed),
-        inserted_count.load(Ordering::Relaxed)
+        final_inserted
     ));
 
     // Wait for progress thread
     progress_thread.join().unwrap();
 
-    Ok(())
+    Ok((final_inserted, final_recorded))
 }
 
 /// Index commits in a git range

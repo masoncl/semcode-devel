@@ -162,27 +162,21 @@ fn fetch_lore_manifest() -> Result<serde_json::Value> {
     Ok(manifest)
 }
 
-/// Resolve a lore list name to a full git URL
-fn resolve_lore_url(lore_arg: &str, manifest: &serde_json::Value) -> Result<String> {
-    // Parse the list name and optional archive number
-    let (list_name, archive_num) = if let Some(slash_pos) = lore_arg.find('/') {
-        let (name, num) = lore_arg.split_at(slash_pos);
-        let num = num.trim_start_matches('/');
-        (name, Some(num))
-    } else {
-        (lore_arg, None)
-    };
-
+/// Return all `(archive_num, url)` entries for `list_name` in the lore.kernel.org
+/// manifest, sorted ascending by `archive_num`.
+fn list_manifest_lore_archives(
+    list_name: &str,
+    manifest: &serde_json::Value,
+) -> Result<Vec<(u32, String)>> {
     // The manifest structure has keys like "/lkml/git/0.git", "/lkml/git/1.git", etc.
     let lists = manifest
         .as_object()
         .ok_or_else(|| anyhow::anyhow!("Manifest is not a JSON object"))?;
 
-    // Find all entries matching the list name pattern
     let pattern = format!("/{}/git/", list_name);
     let mut matching_archives: Vec<(u32, String)> = Vec::new();
 
-    for (key, _value) in lists.iter() {
+    for key in lists.keys() {
         if key.starts_with(&pattern) && key.ends_with(".git") {
             // Extract the archive number from the path
             // Example: "/lkml/git/17.git" -> extract "17"
@@ -198,15 +192,29 @@ fn resolve_lore_url(lore_arg: &str, manifest: &serde_json::Value) -> Result<Stri
         }
     }
 
+    matching_archives.sort_by_key(|(num, _)| *num);
+    Ok(matching_archives)
+}
+
+/// Resolve a lore list name to a full git URL
+fn resolve_lore_url(lore_arg: &str, manifest: &serde_json::Value) -> Result<String> {
+    // Parse the list name and optional archive number
+    let (list_name, archive_num) = if let Some(slash_pos) = lore_arg.find('/') {
+        let (name, num) = lore_arg.split_at(slash_pos);
+        let num = num.trim_start_matches('/');
+        (name, Some(num))
+    } else {
+        (lore_arg, None)
+    };
+
+    let matching_archives = list_manifest_lore_archives(list_name, manifest)?;
+
     if matching_archives.is_empty() {
         return Err(anyhow::anyhow!(
             "List '{}' not found in manifest. Check available lists with SEMCODE_DEBUG=debug",
             list_name
         ));
     }
-
-    // Sort by archive number
-    matching_archives.sort_by_key(|(num, _)| *num);
 
     if let Some(num) = archive_num {
         // Specific archive requested
@@ -493,12 +501,12 @@ fn parse_lore_archive_path(archive_path: &Path, lore_base: &Path) -> Option<(Str
 }
 
 /// Check for new lore archives available on lore.kernel.org that are not locally cached.
-/// Returns a list of (list_name, new_archive_numbers) for lists with newer archives.
+/// Returns a list of `(list_name, Vec<(archive_number, url)>)` for lists with newer archives.
 fn find_new_lore_archives(
     local_archives: &[PathBuf],
     lore_base: &Path,
     manifest: &serde_json::Value,
-) -> Vec<(String, Vec<u32>)> {
+) -> Vec<(String, Vec<(u32, String)>)> {
     use std::collections::HashMap;
 
     // Build a map of list_name -> max local archive number
@@ -520,36 +528,17 @@ fn find_new_lore_archives(
         return Vec::new();
     }
 
-    let lists = match manifest.as_object() {
-        Some(obj) => obj,
-        None => return Vec::new(),
-    };
-
-    let mut new_archives: Vec<(String, Vec<u32>)> = Vec::new();
+    let mut new_archives: Vec<(String, Vec<(u32, String)>)> = Vec::new();
 
     for (list_name, max_local) in &local_max {
-        // Find all archives for this list in the manifest
-        let pattern = format!("/{}/git/", list_name);
-        let mut remote_archives: Vec<u32> = Vec::new();
-
-        for key in lists.keys() {
-            if key.starts_with(&pattern) && key.ends_with(".git") {
-                if let Some(num_str) = key
-                    .strip_prefix(&pattern)
-                    .and_then(|s| s.strip_suffix(".git"))
-                {
-                    if let Ok(num) = num_str.parse::<u32>() {
-                        if num > *max_local {
-                            remote_archives.push(num);
-                        }
-                    }
-                }
+        if let Ok(remote_archives) = list_manifest_lore_archives(list_name, manifest) {
+            let newer: Vec<(u32, String)> = remote_archives
+                .into_iter()
+                .filter(|(num, _)| *num > *max_local)
+                .collect();
+            if !newer.is_empty() {
+                new_archives.push((list_name.clone(), newer));
             }
-        }
-
-        if !remote_archives.is_empty() {
-            remote_archives.sort();
-            new_archives.push((list_name.clone(), remote_archives));
         }
     }
 
@@ -612,6 +601,71 @@ async fn fetch_lore_archive(repo_path: PathBuf) -> Result<gix::Repository> {
 struct LoreIndexResult {
     new_emails: usize,
     total_emails: usize,
+    /// True if all commits in the archive are recorded in `lore_indexed_commits`
+    /// (`recorded_commits == new_commits.len()`).
+    fully_indexed: bool,
+}
+
+/// Status of a refreshed or newly cloned lore shard (`<list>/<num>`).
+#[derive(Debug, Clone)]
+struct LoreShardStatus {
+    list_name: String,
+    shard_num: u32,
+    fully_indexed: bool,
+}
+
+/// Aggregated statistics and per-shard statuses across a lore refresh run.
+#[derive(Default)]
+struct LoreRefreshStats {
+    total_archives: usize,
+    archives_processed: usize,
+    total_new_emails: usize,
+    total_emails_all_archives: usize,
+    failed_archives: Vec<(String, String)>,
+    lists_with_errors: HashSet<String>,
+    shard_statuses: Vec<LoreShardStatus>,
+}
+
+impl LoreRefreshStats {
+    /// Record the outcome of refreshing or indexing a single `<list>/<num>` shard.
+    fn record_archive_outcome(&mut self, display_name: String, outcome: Result<LoreIndexResult>) {
+        self.total_archives += 1;
+        match outcome {
+            Ok(index_result) => {
+                self.total_new_emails += index_result.new_emails;
+                self.total_emails_all_archives += index_result.total_emails;
+                if index_result.fully_indexed {
+                    self.archives_processed += 1;
+                } else {
+                    self.failed_archives.push((
+                        display_name.clone(),
+                        "incomplete commit indexing (some batches failed)".to_string(),
+                    ));
+                }
+
+                if let Some((list_name, num_str)) = display_name.split_once('/') {
+                    let list_name = list_name.to_string();
+                    let shard_num = num_str.parse::<u32>().ok();
+                    if !index_result.fully_indexed {
+                        self.lists_with_errors.insert(list_name.clone());
+                    }
+                    if let Some(shard_num) = shard_num {
+                        self.shard_statuses.push(LoreShardStatus {
+                            list_name,
+                            shard_num,
+                            fully_indexed: index_result.fully_indexed,
+                        });
+                    }
+                }
+            }
+            Err(e) => {
+                if let Some((list_name, _)) = display_name.split_once('/') {
+                    self.lists_with_errors.insert(list_name.to_string());
+                }
+                self.failed_archives.push((display_name, e.to_string()));
+            }
+        }
+    }
 }
 
 /// Index a lore archive repository, filtering out already-indexed commits.
@@ -685,13 +739,14 @@ async fn index_lore_archive(
         return Ok(LoreIndexResult {
             new_emails: 0,
             total_emails: total_commits,
+            fully_indexed: true,
         });
     }
 
     let new_count = new_commits.len();
 
     // Process new commits
-    process_lore_commits_pipeline(
+    let (inserted, recorded_commits) = process_lore_commits_pipeline(
         archive_path,
         new_commits,
         db_manager.clone(),
@@ -703,13 +758,196 @@ async fn index_lore_archive(
 
     println!(
         "Indexed {} new emails from {} (total in archive: {})",
-        new_count, display_name, total_commits
+        inserted, display_name, total_commits
     );
 
     Ok(LoreIndexResult {
-        new_emails: new_count,
+        new_emails: inserted,
         total_emails: total_commits,
+        fully_indexed: recorded_commits == new_count,
     })
+}
+
+/// Clone a lore archive (if not already cloned) and index its commits.
+async fn clone_and_index_lore_archive(
+    lore_url: &str,
+    display_name: &str,
+    database_path: &str,
+    db_manager: &Arc<DatabaseManager>,
+    batch_size: usize,
+    num_workers: usize,
+    db_threads: usize,
+) -> Result<LoreIndexResult> {
+    let clone_path = clone_lore_repository(lore_url, database_path).await?;
+    info!("Lore archive cloned to: {}", clone_path.display());
+
+    let lore_repo = gix::discover(&clone_path).map_err(|e| {
+        anyhow::anyhow!("Error opening repository {}: {}", clone_path.display(), e)
+    })?;
+
+    index_lore_archive(
+        lore_repo,
+        &clone_path,
+        display_name,
+        db_manager,
+        batch_size,
+        num_workers,
+        db_threads,
+    )
+    .await
+}
+
+/// Remove local git clone directories for superseded shards (`< max_num`) of a mailing list
+/// once:
+/// 1. New shards (`> old_num`) from `manifest.js.gz` were checked and cloned *before*
+///    fetching the superseded shards (guaranteeing the superseded shards were already
+///    permanently sealed on `lore.kernel.org` prior to `git fetch`), AND
+/// 2. All shards for the list in this run were indexed completely (`fully_indexed == true`)
+///    with no fetch/index errors, AND
+/// 3. A newer shard (`max_num > shard_num`) is present and fully indexed.
+///
+/// Note: This only deletes the bare git repository under `<db_path>/lore/<list_name>/<old_num>`;
+/// all indexed emails remain permanently stored in the LanceDB `lore` table.
+fn retire_superseded_lore_archives(
+    lore_base: &Path,
+    shard_statuses: &[LoreShardStatus],
+    lists_with_errors: &HashSet<String>,
+) {
+    let mut by_list: std::collections::HashMap<&str, Vec<&LoreShardStatus>> =
+        std::collections::HashMap::new();
+    for status in shard_statuses {
+        by_list
+            .entry(status.list_name.as_str())
+            .or_default()
+            .push(status);
+    }
+
+    for (list_name, shards) in by_list {
+        if lists_with_errors.contains(list_name) || shards.iter().any(|s| !s.fully_indexed) {
+            continue;
+        }
+
+        let Some(max_num) = shards.iter().map(|s| s.shard_num).max() else {
+            continue;
+        };
+
+        for shard in shards {
+            if shard.shard_num < max_num {
+                let shard_path = lore_base
+                    .join(list_name)
+                    .join(shard.shard_num.to_string());
+                if !shard_path.exists() {
+                    continue;
+                }
+
+                println!(
+                    "Retiring superseded lore archive: {}/{} (verified complete)",
+                    list_name, shard.shard_num
+                );
+                if let Err(e) = std::fs::remove_dir_all(&shard_path) {
+                    warn!(
+                        "Failed to remove superseded archive {}: {}",
+                        shard_path.display(),
+                        e
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Compact lore tables and update/optimize FTS indices after new emails are indexed.
+async fn compact_and_optimize_lore_tables(db_manager: &DatabaseManager) {
+    println!("\nCompacting lore tables...");
+    match db_manager.compact_lore_tables().await {
+        Ok(_) => println!("Lore table compaction completed successfully"),
+        Err(e) => error!("Failed to compact lore tables: {}", e),
+    }
+
+    println!("\nUpdating FTS indices for lore table...");
+    match db_manager.ensure_lore_fts_indices().await {
+        Ok(_) => {}
+        Err(e) => eprintln!("Warning: Failed to ensure FTS indices: {}", e),
+    }
+    match db_manager.optimize_lore_fts_indices().await {
+        Ok(_) => println!("FTS indices updated successfully"),
+        Err(e) => eprintln!("Warning: Failed to optimize FTS indices: {}", e),
+    }
+}
+
+/// Check `lore.kernel.org` manifest for newly created shards of tracked mailing lists,
+/// clone and index them, and return their `LoreRefreshStats`.
+async fn sync_new_lore_archives(
+    archive_paths: &[PathBuf],
+    lore_base: &Path,
+    database_path: &str,
+    db_manager: &Arc<DatabaseManager>,
+    batch_size: usize,
+    num_workers: usize,
+    db_threads: usize,
+) -> LoreRefreshStats {
+    let mut stats = LoreRefreshStats::default();
+
+    println!("\nChecking for new lore archives...");
+    let manifest = match fetch_lore_manifest() {
+        Ok(m) => m,
+        Err(e) => {
+            warn!("Could not check for new archives: {}", e);
+            println!(
+                "Note: Could not fetch lore manifest to check for new archives: {}",
+                e
+            );
+            return stats;
+        }
+    };
+
+    let new_archives = find_new_lore_archives(archive_paths, lore_base, &manifest);
+    if new_archives.is_empty() {
+        println!("All tracked mailing lists are up to date.");
+        return stats;
+    }
+
+    println!(
+        "\n{}",
+        "New archives available on lore.kernel.org (auto-indexing):".yellow()
+    );
+    for (list_name, archive_entries) in &new_archives {
+        let nums_str: Vec<String> = archive_entries
+            .iter()
+            .map(|(n, _)| n.to_string())
+            .collect();
+        println!("  {}: archive(s) {}", list_name.cyan(), nums_str.join(", "));
+    }
+
+    for (list_name, archive_entries) in &new_archives {
+        for (num, lore_url) in archive_entries {
+            let display_name = format!("{}/{}", list_name, num);
+
+            println!(
+                "\n=== Cloning and indexing new lore archive: {} ===",
+                display_name
+            );
+            info!("Cloning and indexing new lore archive: {}", display_name);
+
+            let outcome = clone_and_index_lore_archive(
+                lore_url,
+                &display_name,
+                database_path,
+                db_manager,
+                batch_size,
+                num_workers,
+                db_threads,
+            )
+            .await;
+
+            if let Err(ref e) = outcome {
+                eprintln!("Error processing {}: {:#}", display_name, e);
+            }
+            stats.record_archive_outcome(display_name, outcome);
+        }
+    }
+
+    stats
 }
 
 // ==================== Branch Indexing Support ====================
@@ -1046,30 +1284,10 @@ async fn main() -> Result<()> {
                 println!("\n=== Processing lore archive: {} ===", lore_url);
                 info!("Processing lore archive: {}", lore_url);
 
-                // Clone the repository
-                let clone_path = match clone_lore_repository(lore_url, &database_path).await {
-                    Ok(path) => path,
-                    Err(e) => {
-                        eprintln!("Error cloning {}: {:#}", lore_url, e);
-                        continue;
-                    }
-                };
-                info!("Lore archive cloned to: {}", clone_path.display());
-
-                // Open the repository
-                let lore_repo = match gix::discover(&clone_path) {
-                    Ok(repo) => repo,
-                    Err(e) => {
-                        eprintln!("Error opening repository {}: {}", clone_path.display(), e);
-                        continue;
-                    }
-                };
-
-                // Index the archive using the shared function
-                match index_lore_archive(
-                    lore_repo,
-                    &clone_path,
+                match clone_and_index_lore_archive(
                     lore_url,
+                    lore_url,
+                    &database_path,
                     &db_manager,
                     batch_size,
                     num_workers,
@@ -1082,7 +1300,7 @@ async fn main() -> Result<()> {
                         total_emails_all_archives += result.total_emails;
                     }
                     Err(e) => {
-                        eprintln!("Error indexing {}: {}", lore_url, e);
+                        eprintln!("Error processing {}: {:#}", lore_url, e);
                         continue;
                     }
                 }
@@ -1100,30 +1318,7 @@ async fn main() -> Result<()> {
             );
 
             if total_new_emails > 0 {
-                // Compact only lore tables.  The full optimize_database()
-                // method processes every table in the database including
-                // code-index tables and content shards that a lore run
-                // never touches.  On memory-constrained systems the
-                // combined working set triggers the OOM killer.
-                println!("\nCompacting lore tables...");
-                match db_manager.compact_lore_tables().await {
-                    Ok(_) => println!("Lore table compaction completed successfully"),
-                    Err(e) => error!("Failed to compact lore tables: {}", e),
-                }
-
-                // Create FTS indices on first run; merge new rows on
-                // subsequent runs.  LanceDB's native FTS engine serves
-                // unindexed rows via brute-force fallback, so queries
-                // remain correct before optimize completes.
-                println!("\nUpdating FTS indices for lore table...");
-                match db_manager.ensure_lore_fts_indices().await {
-                    Ok(_) => {}
-                    Err(e) => eprintln!("Warning: Failed to ensure FTS indices: {}", e),
-                }
-                match db_manager.optimize_lore_fts_indices().await {
-                    Ok(_) => println!("FTS indices updated successfully"),
-                    Err(e) => eprintln!("Warning: Failed to optimize FTS indices: {}", e),
-                }
+                compact_and_optimize_lore_tables(&db_manager).await;
             }
 
             println!("\nTo query this database, run:");
@@ -1189,61 +1384,55 @@ async fn main() -> Result<()> {
             let batch_size = 1024;
             let num_workers = num_cpus::get();
             let db_threads = args.db_threads;
-            let total_archives = archives_with_names.len();
 
             // Process archives sequentially.  LanceDB merge_insert
             // uses a shared DataFusion memory pool, and concurrent
             // pipelines writing large lore emails exhaust it,
             // causing both to stall indefinitely.
-            let mut results: Vec<Result<(String, LoreIndexResult), (String, anyhow::Error)>> =
-                Vec::with_capacity(total_archives);
+            // Check for new archives on lore.kernel.org FIRST before fetching
+            // existing shards. Because public-inbox v2 permanently seals shard M
+            // once shard N > M is created, discovering N before calling git fetch
+            // on M guarantees that M's fetch retrieves its final commits.
+            let mut stats = sync_new_lore_archives(
+                &archive_paths,
+                &lore_base,
+                &database_path,
+                &db_manager,
+                batch_size,
+                num_workers,
+                db_threads,
+            )
+            .await;
 
             for (archive_path, display_name) in archives_with_names {
                 println!("\n=== Refreshing lore archive: {} ===", display_name);
                 println!("[{}] Fetching updates from remote...", display_name);
 
-                let lore_repo = match fetch_lore_archive(archive_path.clone()).await {
-                    Ok(repo) => repo,
-                    Err(e) => {
-                        results.push(Err((display_name, e)));
-                        continue;
+                let outcome = match fetch_lore_archive(archive_path.clone()).await {
+                    Ok(lore_repo) => {
+                        index_lore_archive(
+                            lore_repo,
+                            &archive_path,
+                            &display_name,
+                            &db_manager,
+                            batch_size,
+                            num_workers,
+                            db_threads,
+                        )
+                        .await
                     }
+                    Err(e) => Err(e),
                 };
-
-                match index_lore_archive(
-                    lore_repo,
-                    &archive_path,
-                    &display_name,
-                    &db_manager,
-                    batch_size,
-                    num_workers,
-                    db_threads,
-                )
-                .await
-                {
-                    Ok(result) => results.push(Ok((display_name, result))),
-                    Err(e) => results.push(Err((display_name, e))),
-                }
+                stats.record_archive_outcome(display_name, outcome);
             }
 
-            // Aggregate results
-            let mut total_new_emails = 0usize;
-            let mut total_emails_all_archives = 0usize;
-            let mut archives_processed = 0usize;
-            let mut failed_archives: Vec<(String, String)> = Vec::new();
-
-            for result in results {
-                match result {
-                    Ok((_, index_result)) => {
-                        total_new_emails += index_result.new_emails;
-                        total_emails_all_archives += index_result.total_emails;
-                        archives_processed += 1;
-                    }
-                    Err((name, e)) => {
-                        failed_archives.push((name, e.to_string()));
-                    }
-                }
-            }
+            // Retire any superseded older shard git directories whose newer shard
+            // and final tail commits are now 100% indexed.
+            retire_superseded_lore_archives(
+                &lore_base,
+                &stats.shard_statuses,
+                &stats.lists_with_errors,
+            );
 
             let total_time = start_time.elapsed();
 
@@ -1251,73 +1440,24 @@ async fn main() -> Result<()> {
             println!("Total time: {:.1}s", total_time.as_secs_f64());
             println!(
                 "Archives refreshed: {}/{}",
-                archives_processed, total_archives
+                stats.archives_processed, stats.total_archives
             );
-            println!("New emails indexed: {}", total_new_emails);
+            println!("New emails indexed: {}", stats.total_new_emails);
             println!(
-                "Total emails across archives: {}",
-                total_emails_all_archives
+                "Total commits across active archives: {}",
+                stats.total_emails_all_archives
             );
 
             // Report failed archives if any
-            if !failed_archives.is_empty() {
+            if !stats.failed_archives.is_empty() {
                 eprintln!("\nFailed archives:");
-                for (name, err) in &failed_archives {
+                for (name, err) in &stats.failed_archives {
                     eprintln!("  {}: {}", name, err);
                 }
             }
 
-            if total_new_emails > 0 {
-                println!("\nCompacting lore tables...");
-                match db_manager.compact_lore_tables().await {
-                    Ok(_) => println!("Lore table compaction completed successfully"),
-                    Err(e) => error!("Failed to compact lore tables: {}", e),
-                }
-
-                println!("\nUpdating FTS indices for lore table...");
-                match db_manager.ensure_lore_fts_indices().await {
-                    Ok(_) => {}
-                    Err(e) => eprintln!("Warning: Failed to ensure FTS indices: {}", e),
-                }
-                match db_manager.optimize_lore_fts_indices().await {
-                    Ok(_) => println!("FTS indices updated successfully"),
-                    Err(e) => eprintln!("Warning: Failed to optimize FTS indices: {}", e),
-                }
-            }
-
-            // Check for new archives available on lore.kernel.org
-            println!("\nChecking for new lore archives...");
-            match fetch_lore_manifest() {
-                Ok(manifest) => {
-                    let new_archives =
-                        find_new_lore_archives(&archive_paths, &lore_base, &manifest);
-                    if new_archives.is_empty() {
-                        println!("All tracked mailing lists are up to date.");
-                    } else {
-                        println!(
-                            "\n{}",
-                            "New archives available on lore.kernel.org:".yellow()
-                        );
-                        for (list_name, archive_nums) in &new_archives {
-                            let nums_str: Vec<String> =
-                                archive_nums.iter().map(|n| n.to_string()).collect();
-                            println!("  {}: archive(s) {}", list_name.cyan(), nums_str.join(", "));
-                        }
-                        println!("\nTo add these archives, run:");
-                        for (list_name, archive_nums) in &new_archives {
-                            for num in archive_nums {
-                                println!("  semcode-index --lore {}/{}", list_name, num);
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!("Could not check for new archives: {}", e);
-                    println!(
-                        "Note: Could not fetch lore manifest to check for new archives: {}",
-                        e
-                    );
-                }
+            if stats.total_new_emails > 0 {
+                compact_and_optimize_lore_tables(&db_manager).await;
             }
 
             println!("\nTo query this database, run:");
@@ -1745,4 +1885,75 @@ async fn run_pipeline(args: Args) -> Result<()> {
         println!("\n🎉 Indexing completed successfully!");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_retire_superseded_lore_archives() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let lore_base = temp_dir.path().join("lore");
+
+        let lkml_18 = lore_base.join("lkml").join("18");
+        let lkml_19 = lore_base.join("lkml").join("19");
+        let lkml_20 = lore_base.join("lkml").join("20");
+        let input_0 = lore_base.join("linux-input").join("0");
+
+        std::fs::create_dir_all(&lkml_18).unwrap();
+        std::fs::create_dir_all(&lkml_19).unwrap();
+        std::fs::create_dir_all(&lkml_20).unwrap();
+        std::fs::create_dir_all(&input_0).unwrap();
+
+        // Pass 1: if any shard for lkml is not fully_indexed, no shards for lkml
+        // should be retired.
+        let statuses_incomplete = vec![
+            LoreShardStatus {
+                list_name: "lkml".to_string(),
+                shard_num: 18,
+                fully_indexed: true,
+            },
+            LoreShardStatus {
+                list_name: "lkml".to_string(),
+                shard_num: 19,
+                fully_indexed: false,
+            },
+            LoreShardStatus {
+                list_name: "lkml".to_string(),
+                shard_num: 20,
+                fully_indexed: true,
+            },
+        ];
+        retire_superseded_lore_archives(&lore_base, &statuses_incomplete, &HashSet::new());
+        assert!(lkml_18.exists(), "shard 18 must not be retired when list has incomplete shard");
+        assert!(lkml_19.exists(), "incomplete shard 19 must not be retired");
+        assert!(lkml_20.exists(), "current shard 20 must be kept");
+
+        // Pass 2: once all shards (18, 19, 20) are fully indexed, superseded shards
+        // 18 and 19 are retired and shard 20 is kept.
+        let statuses_complete = vec![
+            LoreShardStatus {
+                list_name: "lkml".to_string(),
+                shard_num: 18,
+                fully_indexed: true,
+            },
+            LoreShardStatus {
+                list_name: "lkml".to_string(),
+                shard_num: 19,
+                fully_indexed: true,
+            },
+            LoreShardStatus {
+                list_name: "lkml".to_string(),
+                shard_num: 20,
+                fully_indexed: true,
+            },
+        ];
+        retire_superseded_lore_archives(&lore_base, &statuses_complete, &HashSet::new());
+
+        assert!(!lkml_18.exists(), "superseded shard 18 should be retired");
+        assert!(!lkml_19.exists(), "superseded shard 19 should be retired");
+        assert!(lkml_20.exists(), "current shard 20 must be kept");
+        assert!(input_0.exists(), "unrelated list must be untouched");
+    }
 }
