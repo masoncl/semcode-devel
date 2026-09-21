@@ -188,6 +188,7 @@ pub struct DatabaseManager {
     /// refreshed for. `u64::MAX` means "never built", so the first build on
     /// generation 0 is not mistaken for already-current.
     workdir_index_generation: AtomicU64,
+    lore_message_id_cache: tokio::sync::Mutex<Option<HashSet<String>>>,
 }
 
 impl DatabaseManager {
@@ -235,6 +236,7 @@ impl DatabaseManager {
             git_only: AtomicBool::new(false),
             workdir_command_generation: AtomicU64::new(0),
             workdir_index_generation: AtomicU64::new(u64::MAX),
+            lore_message_id_cache: tokio::sync::Mutex::new(None),
         })
     }
 
@@ -417,6 +419,8 @@ impl DatabaseManager {
     }
 
     pub async fn clear_all_data(&self) -> Result<()> {
+        *self.lore_message_id_cache.lock().await = None;
+
         // Delete all data from each main table
         for table_name in &[
             "functions",
@@ -823,11 +827,13 @@ impl DatabaseManager {
     }
 
     pub async fn compact_lore_tables(&self) -> Result<()> {
+        *self.lore_message_id_cache.lock().await = None;
         self.schema_manager.compact_lore_tables().await
     }
 
     /// Drop and recreate all tables for maximum space savings
     pub async fn drop_and_recreate_tables(&self) -> Result<()> {
+        *self.lore_message_id_cache.lock().await = None;
         self.schema_manager.drop_and_recreate_tables().await
     }
 
@@ -875,6 +881,9 @@ impl DatabaseManager {
 
     /// Drop and recreate a specific table
     pub async fn drop_and_recreate_table(&self, table_name: &str) -> Result<()> {
+        if table_name == "lore" {
+            *self.lore_message_id_cache.lock().await = None;
+        }
         self.schema_manager
             .drop_and_recreate_table(table_name)
             .await
@@ -5921,7 +5930,9 @@ impl DatabaseManager {
         // lore_indexed_commits.  Filtering avoids duplicates without
         // relying on merge_insert, which hits a spurious null-column
         // error in lance-file 3.0.1.
-        let new_indices = Self::filter_existing_lore_ids(&table, emails, &dedup_indices).await?;
+        let new_indices = self
+            .filter_existing_lore_ids(&table, emails, &dedup_indices)
+            .await?;
 
         if new_indices.len() < dedup_indices.len() {
             tracing::info!(
@@ -5983,6 +5994,15 @@ impl DatabaseManager {
                 failed_indices.len(),
                 new_indices.len()
             );
+
+            // Remove any failed message_ids that were pre-claimed in
+            // filter_existing_lore_ids so they can be retried later.
+            let mut cache_guard = self.lore_message_id_cache.lock().await;
+            if let Some(ref mut known_ids) = *cache_guard {
+                for &idx in &failed_indices {
+                    known_ids.remove(&emails[idx].message_id);
+                }
+            }
         }
 
         tracing::info!("insert_lore_emails: Batch insertion complete");
@@ -5990,54 +6010,51 @@ impl DatabaseManager {
         Ok(failed_indices)
     }
 
-    /// Return the subset of `indices` whose message_id does not
-    /// already exist in the lore table.
+    /// Return the subset of `indices` whose `message_id` does not
+    /// already exist in the lore table, using an in-memory `HashSet`
+    /// populated once via a streaming column read instead of running a
+    /// full-table `message_id IN (...)` DataFusion scan on every batch.
+    ///
+    /// Atomically inserts candidate `message_id`s into the cached set
+    /// while holding `lore_message_id_cache` so concurrent inserter tasks
+    /// cannot both pass the check for the same `message_id`.
     async fn filter_existing_lore_ids(
+        &self,
         table: &lancedb::Table,
         emails: &[crate::types::LoreEmailInfo],
         indices: &[usize],
     ) -> Result<Vec<usize>> {
-        use futures::TryStreamExt as _;
+        let mut cache_guard = self.lore_message_id_cache.lock().await;
+        if cache_guard.is_none() {
+            let mut stream = table
+                .query()
+                .select(lancedb::query::Select::Columns(vec![
+                    "message_id".to_string()
+                ]))
+                .execute()
+                .await?;
 
-        // Build an IN-list predicate.  message_ids are already
-        // validated to be non-empty, but escape single quotes for
-        // the SQL literal.
-        let id_list: Vec<String> = indices
-            .iter()
-            .map(|&i| format!("'{}'", emails[i].message_id.replace('\'', "''")))
-            .collect();
-
-        let predicate = format!("message_id IN ({})", id_list.join(", "));
-
-        let stream = table
-            .query()
-            .select(lancedb::query::Select::Columns(vec![
-                "message_id".to_string()
-            ]))
-            .only_if(&predicate)
-            .execute()
-            .await?;
-        let batches: Vec<_> = stream.try_collect().await?;
-
-        let mut existing = std::collections::HashSet::new();
-        for batch in &batches {
-            if let Some(col) = batch.column_by_name("message_id") {
-                let arr = col
-                    .as_any()
-                    .downcast_ref::<arrow::array::StringArray>()
-                    .expect("message_id column must be StringArray");
-                for i in 0..arr.len() {
-                    if !arr.is_null(i) {
-                        existing.insert(arr.value(i).to_string());
+            let mut existing = HashSet::new();
+            while let Some(batch) = stream.try_next().await? {
+                if let Some(col) = batch.column_by_name("message_id") {
+                    if let Some(arr) = col.as_any().downcast_ref::<arrow::array::StringArray>() {
+                        existing.reserve(arr.len());
+                        for i in 0..arr.len() {
+                            if !arr.is_null(i) {
+                                existing.insert(arr.value(i).to_string());
+                            }
+                        }
                     }
                 }
             }
+            *cache_guard = Some(existing);
         }
 
+        let existing = cache_guard.as_mut().unwrap();
         Ok(indices
             .iter()
             .copied()
-            .filter(|&i| !existing.contains(&emails[i].message_id))
+            .filter(|&i| existing.insert(emails[i].message_id.clone()))
             .collect())
     }
 
@@ -7780,7 +7797,7 @@ impl DatabaseManager {
             }
         };
 
-        let stream = table
+        let mut stream = table
             .query()
             .select(lancedb::query::Select::Columns(vec![
                 "git_commit_sha".to_string()
@@ -7788,9 +7805,8 @@ impl DatabaseManager {
             .execute()
             .await?;
 
-        let batches: Vec<_> = stream.try_collect().await?;
         let mut existing = HashSet::new();
-        for batch in batches {
+        while let Some(batch) = stream.try_next().await? {
             if let Some(column) = batch.column_by_name("git_commit_sha") {
                 if let Some(string_array) = column.as_any().downcast_ref::<StringArray>() {
                     existing.reserve(string_array.len());
