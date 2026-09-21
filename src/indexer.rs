@@ -856,6 +856,12 @@ pub async fn process_lore_commits_pipeline(
     use indicatif::{ProgressBar, ProgressStyle};
     use std::sync::Mutex;
 
+    // Cap git worker threads so we don't open 100+ separate gix::Repository
+    // packfile mmaps/caches on high-core-count machines.
+    let batch_size = batch_size.max(1);
+    let num_workers = num_workers.clamp(1, 16);
+    let num_inserters = num_inserters.max(1);
+
     // Create progress bar
     let pb = ProgressBar::new(commit_shas.len() as u64);
     pb.set_style(
@@ -866,10 +872,15 @@ pub async fn process_lore_commits_pipeline(
         .progress_chars("█▓▒░  ")
     );
 
-    // Create channels for streaming
+    // Workers send individual parsed items into a bounded channel (`batch_size * 2`),
+    // and a single collector thread assembles full `batch_size` batches for the
+    // database inserters. This prevents `num_workers` threads from each hoarding
+    // up to `batch_size` emails in RAM simultaneously (`num_workers * batch_size`
+    // emails) and flushing `num_workers` fragmented batches when `commit_tx` closes.
     let (commit_tx, commit_rx) = mpsc::channel::<String>();
+    let (item_tx, item_rx) = mpsc::sync_channel::<LoreCommitParseOutcome>(batch_size * 2);
     let (result_tx, result_rx) =
-        mpsc::sync_channel::<(Vec<crate::LoreEmailInfo>, Vec<String>)>(10);
+        tokio::sync::mpsc::channel::<(Vec<crate::LoreEmailInfo>, Vec<String>)>(4);
 
     // Wrap receiver for shared access
     let shared_commit_rx = Arc::new(Mutex::new(commit_rx));
@@ -895,7 +906,7 @@ pub async fn process_lore_commits_pipeline(
     let mut worker_handles = Vec::new();
     for worker_id in 0..num_workers {
         let worker_commit_rx = shared_commit_rx.clone();
-        let worker_result_tx = result_tx.clone();
+        let worker_item_tx = item_tx.clone();
         let worker_repo_path = repo_path.to_path_buf();
         let worker_processed = processed_count.clone();
 
@@ -909,11 +920,7 @@ pub async fn process_lore_commits_pipeline(
                 }
             };
 
-            let mut batch = Vec::new();
-            let mut non_email_shas = Vec::new();
-
             loop {
-                // Get next commit SHA
                 let commit_sha = {
                     match worker_commit_rx.lock() {
                         Ok(rx) => rx.recv(),
@@ -927,13 +934,11 @@ pub async fn process_lore_commits_pipeline(
                 match commit_sha {
                     Ok(sha) => {
                         match parse_lore_commit_entry(&thread_repo, &sha) {
-                            Ok(LoreCommitParseOutcome::Email(email_info)) => {
-                                batch.push(*email_info);
+                            Ok(outcome) => {
                                 worker_processed.fetch_add(1, Ordering::Relaxed);
-                            }
-                            Ok(LoreCommitParseOutcome::NoEmailFile(non_email_sha)) => {
-                                non_email_shas.push(non_email_sha);
-                                worker_processed.fetch_add(1, Ordering::Relaxed);
+                                if worker_item_tx.send(outcome).is_err() {
+                                    break;
+                                }
                             }
                             Err(e) => {
                                 warn!(
@@ -943,30 +948,48 @@ pub async fn process_lore_commits_pipeline(
                                 worker_processed.fetch_add(1, Ordering::Relaxed);
                             }
                         }
-
-                        if batch.len() + non_email_shas.len() >= batch_size {
-                            let send_emails = std::mem::take(&mut batch);
-                            let send_non_email = std::mem::take(&mut non_email_shas);
-                            if worker_result_tx
-                                .send((send_emails, send_non_email))
-                                .is_err()
-                            {
-                                break;
-                            }
-                        }
                     }
-                    Err(_) => {
-                        // Channel closed, send remaining batch
-                        if !batch.is_empty() || !non_email_shas.is_empty() {
-                            let _ = worker_result_tx.send((batch, non_email_shas));
-                        }
-                        break;
-                    }
+                    Err(_) => break,
                 }
             }
         });
         worker_handles.push(handle);
     }
+
+    drop(shared_commit_rx);
+    drop(item_tx);
+
+    // Single batch-collector thread to assemble uniform `batch_size` batches
+    let collector_handle = thread::spawn(move || {
+        let mut emails_batch = Vec::with_capacity(batch_size);
+        let mut non_email_shas = Vec::new();
+
+        for outcome in item_rx {
+            match outcome {
+                LoreCommitParseOutcome::Email(email_info) => {
+                    emails_batch.push(*email_info);
+                }
+                LoreCommitParseOutcome::NoEmailFile(sha) => {
+                    non_email_shas.push(sha);
+                }
+            }
+
+            if emails_batch.len() + non_email_shas.len() >= batch_size {
+                let send_emails = std::mem::replace(
+                    &mut emails_batch,
+                    Vec::with_capacity(batch_size),
+                );
+                let send_non_email = std::mem::take(&mut non_email_shas);
+                if result_tx.blocking_send((send_emails, send_non_email)).is_err() {
+                    return;
+                }
+            }
+        }
+
+        if !emails_batch.is_empty() || !non_email_shas.is_empty() {
+            let _ = result_tx.blocking_send((emails_batch, non_email_shas));
+        }
+    });
 
     // Spawn producer thread to feed commit SHAs
     let producer_handle = thread::spawn(move || {
@@ -977,11 +1000,8 @@ pub async fn process_lore_commits_pipeline(
         }
     });
 
-    // Close original senders
-    drop(result_tx);
-
-    // Wrap result receiver for shared access
-    let shared_result_rx = Arc::new(Mutex::new(result_rx));
+    // Wrap async result receiver for shared access across inserter tasks
+    let shared_result_rx = Arc::new(tokio::sync::Mutex::new(result_rx));
 
     // Shared flag to coordinate periodic optimization checks
     // Only one inserter should check at a time to avoid redundant checks
@@ -1002,19 +1022,14 @@ pub async fn process_lore_commits_pipeline(
 
         let handle = tokio::spawn(async move {
             loop {
-                // Get next batch from shared receiver
+                // Get next batch from shared async receiver without blocking Tokio threads
                 let batch = {
-                    match result_rx_clone.lock() {
-                        Ok(rx) => rx.recv(),
-                        Err(e) => {
-                            error!("Inserter {} failed to lock receiver: {}", inserter_id, e);
-                            break;
-                        }
-                    }
+                    let mut rx = result_rx_clone.lock().await;
+                    rx.recv().await
                 };
 
                 match batch {
-                    Ok((emails, non_email_shas)) => {
+                    Some((emails, non_email_shas)) => {
                         // Insert batch into database
                         match db_manager_clone.insert_lore_emails(&emails).await {
                             Err(e) => {
@@ -1079,7 +1094,7 @@ pub async fn process_lore_commits_pipeline(
                             }
                         }
                     }
-                    Err(_) => {
+                    None => {
                         // Channel closed
                         break;
                     }
@@ -1089,13 +1104,18 @@ pub async fn process_lore_commits_pipeline(
         inserter_handles.push(handle);
     }
 
-    // Wait for all workers to finish
-    for handle in worker_handles {
-        let _ = handle.join();
-    }
+    drop(shared_result_rx);
 
-    // Wait for producer
-    let _ = producer_handle.join();
+    // Join OS worker, collector, and producer threads on the blocking pool
+    // so Tokio runtime threads remain free to drive the inserter futures.
+    let _ = tokio::task::spawn_blocking(move || {
+        for handle in worker_handles {
+            let _ = handle.join();
+        }
+        let _ = collector_handle.join();
+        let _ = producer_handle.join();
+    })
+    .await;
 
     // Wait for all inserters to finish
     for handle in inserter_handles {
