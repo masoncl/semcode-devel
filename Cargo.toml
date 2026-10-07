@@ -58,7 +58,7 @@ shlex = "1.3"           # Shell-like parsing for quoted strings in CLI
 reqwest = { version = "0.13", features = ["blocking", "gzip"] }  # HTTP client for manifest downloads
 flate2 = "1.1"          # gzip compression/decompression
 chrono = "0.4.44"
-chrono-english = "0.1"  # Natural language date parsing
+interim = { version = "0.2", features = ["chrono_0_4"] }  # Natural language date parsing
 base64 = "0.22"         # Base64 decoding for MIME-encoded email bodies
 
 [[bin]]

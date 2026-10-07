@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //! Date parsing utilities for lore email filtering
 //!
-//! Uses chrono-english for natural language date parsing, supporting formats like:
+//! Uses interim for natural language date parsing, supporting formats like:
 //! - Relative: "yesterday", "1 day ago", "2 weeks ago", "3 months ago"
 //! - Absolute: "2024-01-01" (YYYY-MM-DD ISO format)
 //!
@@ -16,28 +16,27 @@ use chrono::Utc;
 /// The lore table stores dates in RFC 2822 format, so we must convert our
 /// filter dates to the same format for SQL string comparison to work.
 ///
-/// Uses chrono-english for flexible natural language date parsing. Examples:
+/// Uses interim for flexible natural language date parsing. Examples:
 /// - "yesterday", "today", "tomorrow"
 /// - "7 days ago", "2 weeks ago", "3 months ago"
 /// - "2024-01-15" (YYYY-MM-DD ISO format)
-/// - And various other formats supported by chrono-english
+/// - And various other formats supported by interim
 pub fn parse_date(date_str: &str) -> Result<String> {
     let date_str = date_str.trim();
 
-    // Use chrono-english to parse the date relative to current time
+    // Use interim to parse the date relative to current time
     let parsed =
-        chrono_english::parse_date_string(date_str, Utc::now(), chrono_english::Dialect::Us)
-            .map_err(|e| {
-                anyhow!(
-                    "Invalid date format: '{}'. Error: {}.\n\
+        interim::parse_date_string(date_str, Utc::now(), interim::Dialect::Us).map_err(|e| {
+            anyhow!(
+                "Invalid date format: '{}'. Error: {}.\n\
              Supported formats include:\n\
              - 'yesterday', 'today'\n\
              - '7 days ago', '2 weeks ago', '3 months ago'\n\
              - 'YYYY-MM-DD' (e.g., '2024-01-15')",
-                    date_str,
-                    e
-                )
-            })?;
+                date_str,
+                e
+            )
+        })?;
 
     Ok(parsed.to_rfc2822())
 }
@@ -125,8 +124,8 @@ mod tests {
 
     #[test]
     fn test_natural_language_formats() {
-        // Test additional natural language formats supported by chrono-english
-        // Note: chrono-english supports many formats, but not all intuitive ones work
+        // Test additional natural language formats supported by interim
+        // Note: interim supports many formats, but not all intuitive ones work
         let test_cases = vec![
             "3 months ago",
             "2024-01-15", // Standard ISO format
