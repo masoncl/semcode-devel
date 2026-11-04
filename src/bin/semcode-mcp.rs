@@ -5933,6 +5933,18 @@ async fn run_stdio_server(server: Arc<McpServer>) -> Result<()> {
 
     let stdout = stdout_clone;
 
+    // Requests used to be answered one after the other from the loop below,
+    // so a query that scans the whole database held up every other client
+    // of the server until it was done. Each request gets a task of its own
+    // now and the responses go out as they finish. JSON-RPC matches them by
+    // id, so the order doesn't matter. A full scan is CPU bound, so the
+    // number of requests in flight is capped at the number of CPUs.
+    let max_in_flight = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .max(2);
+    let in_flight = Arc::new(tokio::sync::Semaphore::new(max_in_flight));
+
     let mut line = String::new();
 
     loop {
@@ -5953,25 +5965,46 @@ async fn run_stdio_server(server: Arc<McpServer>) -> Result<()> {
                     Ok(request) => {
                         // Check if this is a notification (no id) or a request (has id)
                         if request.get("id").is_some() {
-                            // It's a request, send a response
-                            let response = server.handle_request(request).await;
-                            if let Ok(response_str) = serde_json::to_string(&response) {
+                            // It's a request, answer it from a task of its
+                            // own, see max_in_flight above.
+                            let server = server.clone();
+                            let stdout = stdout.clone();
+                            let in_flight = in_flight.clone();
+                            tokio::spawn(async move {
+                                let Ok(_permit) = in_flight.acquire_owned().await else {
+                                    return;
+                                };
+                                // The handlers borrow their arguments across
+                                // awaits in a way rustc can't prove Send for,
+                                // so drive the request on a thread of the
+                                // blocking pool instead. That also keeps a
+                                // CPU bound scan off the runtime's workers.
+                                let handle = tokio::runtime::Handle::current();
+                                let Ok(response) = tokio::task::spawn_blocking(move || {
+                                    handle.block_on(server.handle_request(request))
+                                })
+                                .await
+                                else {
+                                    return;
+                                };
+                                let Ok(response_str) = serde_json::to_string(&response) else {
+                                    return;
+                                };
                                 let mut stdout_guard = stdout.lock().await;
                                 if let Err(e) =
                                     stdout_guard.write_all(response_str.as_bytes()).await
                                 {
                                     eprintln!("Failed to write response: {e}");
-                                    break;
+                                    return;
                                 }
                                 if let Err(e) = stdout_guard.write_all(b"\n").await {
                                     eprintln!("Failed to write newline: {e}");
-                                    break;
+                                    return;
                                 }
                                 if let Err(e) = stdout_guard.flush().await {
                                     eprintln!("Failed to flush stdout: {e}");
-                                    break;
                                 }
-                            }
+                            });
                         } else {
                             // It's a notification, handle without response
                             let method = request["method"].as_str().unwrap_or("");
