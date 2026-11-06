@@ -9,6 +9,7 @@ pub mod git;
 pub mod git_range;
 pub mod hash;
 pub mod indexer;
+pub mod notify;
 pub mod perf_monitor;
 pub mod symbol_walkback;
 pub mod text_utils;

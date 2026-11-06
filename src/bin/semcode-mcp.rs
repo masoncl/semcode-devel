@@ -5704,6 +5704,8 @@ async fn index_current_commit_background(
     eprintln!("[Background] Background indexing task started");
     send_notification("Semcode: Checking if indexing is needed...".to_string());
 
+    semcode::notify::status("Checking the index against the current commit");
+
     // Get current git SHA
     let _git_sha = match semcode::git::get_git_sha(&git_repo) {
         Ok(Some(sha)) => {
@@ -5725,6 +5727,7 @@ async fn index_current_commit_background(
             send_notification(
                 "Semcode: Not in a git repository, skipping auto-indexing".to_string(),
             );
+            semcode::notify::status("Not in a git repository, no index check");
             return;
         }
         Err(e) => {
@@ -5735,6 +5738,7 @@ async fn index_current_commit_background(
                 error: error_msg.clone(),
             };
             send_notification(format!("Semcode: {}", error_msg));
+            semcode::notify::status(&error_msg);
             return;
         }
     };
@@ -5768,6 +5772,16 @@ async fn index_current_commit_background(
                                         changed_file.path,
                                         &new_hash[..8]
                                     );
+                                    {
+                                        let mut state = indexing_state.lock().await;
+                                        state.status =
+                                            IndexingStatus::Completed { files_processed: 0 };
+                                        state.completed_at = Some(std::time::SystemTime::now());
+                                    }
+                                    semcode::notify::ready(&format!(
+                                        "Index up to date for {}",
+                                        &_git_sha[..12.min(_git_sha.len())]
+                                    ));
                                     return;
                                 } else {
                                     eprintln!(
@@ -5782,6 +5796,11 @@ async fn index_current_commit_background(
                                     "[Background] Warning: Failed to get processed files: {}",
                                     e
                                 );
+                                let mut state = indexing_state.lock().await;
+                                state.status = IndexingStatus::Failed {
+                                    error: format!("Failed to get processed files: {}", e),
+                                };
+                                semcode::notify::status(&format!("Index check failed: {}", e));
                                 return;
                             }
                         }
@@ -5817,6 +5836,7 @@ async fn index_current_commit_background(
         };
     }
     send_notification("Semcode: Indexing current commit...".to_string());
+    semcode::notify::status(&format!("Indexing {}", &_git_sha[..12.min(_git_sha.len())]));
 
     // Create synthetic range for current commit: HEAD^..HEAD
     let git_range = format!("{}^..{}", _git_sha, _git_sha);
@@ -5878,6 +5898,10 @@ async fn index_current_commit_background(
                     );
                 }
             }
+            semcode::notify::ready(&format!(
+                "Index up to date for {}",
+                &_git_sha[..12.min(_git_sha.len())]
+            ));
         }
         Err(e) => {
             eprintln!("[Background] Warning: Auto-indexing failed: {}", e);
@@ -5887,6 +5911,7 @@ async fn index_current_commit_background(
             };
             state.completed_at = Some(std::time::SystemTime::now());
             send_notification(format!("Semcode: Indexing failed: {}", e));
+            semcode::notify::status(&format!("Indexing failed: {}", e));
         }
     }
 }
@@ -6107,13 +6132,14 @@ async fn main() -> Result<()> {
     tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
     // Run MCP server on stdio
-    run_stdio_server(server).await?;
+    let served = run_stdio_server(server).await;
+    semcode::notify::stopping();
 
     // Gracefully shutdown the background indexing task
     indexing_handle.abort();
     let _ = indexing_handle.await;
 
-    Ok(())
+    served
 }
 
 #[cfg(test)]
