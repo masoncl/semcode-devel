@@ -157,6 +157,21 @@ All `*_patterns` arrays below are OR'd within the array.
 **indexing_status**: show background indexing progress, errors,
   and timing.  No parameters.
 
+## Startup and readiness
+
+At startup the server checks whether the index covers the current commit
+of the repository and indexes it when it does not. Lookups that arrive
+meanwhile wait for the check (up to 30 seconds) rather than being told
+to retry; only an indexing pass that is still running after that gets
+the "currently being indexed" answer.
+
+The server speaks the sd_notify(3) protocol: when NOTIFY_SOCKET is set
+it sends `STATUS=` lines for the phases and `READY=1` once lookups are
+answered, and `STOPPING=1` when it exits. So `systemd-notify --fork --
+semcode-mcp ...` returns once the server is ready, and a unit with
+`Type=notify` becomes active at that point. A check or indexing failure
+sends a `STATUS=` line and no `READY=1`.
+
 ## Lazy Loading
 
 Start the server with `--lazy` to cut initial context ~96%.  The

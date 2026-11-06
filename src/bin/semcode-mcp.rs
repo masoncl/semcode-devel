@@ -1975,6 +1975,9 @@ struct Args {
     lazy: bool,
 }
 
+/// How long a lookup waits for the startup pass before it is told to retry.
+const STARTUP_WAIT_SECONDS: u64 = 30;
+
 #[derive(Debug, Clone)]
 enum IndexingStatus {
     NotStarted,
@@ -2912,17 +2915,34 @@ impl McpServer {
     }
 
     async fn check_database_status(&self) -> Option<String> {
-        let state = self.indexing_state.lock().await;
-
-        // Check if indexing is currently in progress
-        if matches!(state.status, IndexingStatus::InProgress { .. }) {
-            if let IndexingStatus::InProgress { ref phase, .. } = state.status {
+        // The startup pass first checks whether HEAD is indexed, which takes a
+        // moment, and indexes it when it is not, which can take long. Wait for
+        // the first case instead of sending the caller away; only a pass that
+        // is still running after that is reported.
+        let wait_until =
+            tokio::time::Instant::now() + std::time::Duration::from_secs(STARTUP_WAIT_SECONDS);
+        let state = loop {
+            let state = self.indexing_state.lock().await;
+            let busy = matches!(
+                state.status,
+                IndexingStatus::NotStarted | IndexingStatus::InProgress { .. }
+            );
+            if !busy {
+                break state;
+            }
+            if tokio::time::Instant::now() >= wait_until {
+                let phase = match &state.status {
+                    IndexingStatus::InProgress { phase, .. } => phase.clone(),
+                    _ => "starting".to_string(),
+                };
                 return Some(format!(
                     "Database is currently being indexed ({}). Please wait for indexing to complete and try again. Use the indexing_status tool to check progress.",
                     phase
                 ));
             }
-        }
+            drop(state);
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        };
 
         // Check if indexing failed
         if let IndexingStatus::Failed { ref error } = state.status {
@@ -5704,6 +5724,8 @@ async fn index_current_commit_background(
     eprintln!("[Background] Background indexing task started");
     send_notification("Semcode: Checking if indexing is needed...".to_string());
 
+    semcode::notify::status("Checking the index against the current commit");
+
     // Get current git SHA
     let _git_sha = match semcode::git::get_git_sha(&git_repo) {
         Ok(Some(sha)) => {
@@ -5725,6 +5747,7 @@ async fn index_current_commit_background(
             send_notification(
                 "Semcode: Not in a git repository, skipping auto-indexing".to_string(),
             );
+            semcode::notify::status("Not in a git repository, no index check");
             return;
         }
         Err(e) => {
@@ -5735,6 +5758,7 @@ async fn index_current_commit_background(
                 error: error_msg.clone(),
             };
             send_notification(format!("Semcode: {}", error_msg));
+            semcode::notify::status(&error_msg);
             return;
         }
     };
@@ -5768,6 +5792,16 @@ async fn index_current_commit_background(
                                         changed_file.path,
                                         &new_hash[..8]
                                     );
+                                    {
+                                        let mut state = indexing_state.lock().await;
+                                        state.status =
+                                            IndexingStatus::Completed { files_processed: 0 };
+                                        state.completed_at = Some(std::time::SystemTime::now());
+                                    }
+                                    semcode::notify::ready(&format!(
+                                        "Index up to date for {}",
+                                        &_git_sha[..12.min(_git_sha.len())]
+                                    ));
                                     return;
                                 } else {
                                     eprintln!(
@@ -5782,6 +5816,11 @@ async fn index_current_commit_background(
                                     "[Background] Warning: Failed to get processed files: {}",
                                     e
                                 );
+                                let mut state = indexing_state.lock().await;
+                                state.status = IndexingStatus::Failed {
+                                    error: format!("Failed to get processed files: {}", e),
+                                };
+                                semcode::notify::status(&format!("Index check failed: {}", e));
                                 return;
                             }
                         }
@@ -5817,6 +5856,7 @@ async fn index_current_commit_background(
         };
     }
     send_notification("Semcode: Indexing current commit...".to_string());
+    semcode::notify::status(&format!("Indexing {}", &_git_sha[..12.min(_git_sha.len())]));
 
     // Create synthetic range for current commit: HEAD^..HEAD
     let git_range = format!("{}^..{}", _git_sha, _git_sha);
@@ -5878,6 +5918,10 @@ async fn index_current_commit_background(
                     );
                 }
             }
+            semcode::notify::ready(&format!(
+                "Index up to date for {}",
+                &_git_sha[..12.min(_git_sha.len())]
+            ));
         }
         Err(e) => {
             eprintln!("[Background] Warning: Auto-indexing failed: {}", e);
@@ -5887,6 +5931,7 @@ async fn index_current_commit_background(
             };
             state.completed_at = Some(std::time::SystemTime::now());
             send_notification(format!("Semcode: Indexing failed: {}", e));
+            semcode::notify::status(&format!("Indexing failed: {}", e));
         }
     }
 }
@@ -5933,6 +5978,18 @@ async fn run_stdio_server(server: Arc<McpServer>) -> Result<()> {
 
     let stdout = stdout_clone;
 
+    // Requests used to be answered one after the other from the loop below,
+    // so a query that scans the whole database held up every other client
+    // of the server until it was done. Each request gets a task of its own
+    // now and the responses go out as they finish. JSON-RPC matches them by
+    // id, so the order doesn't matter. A full scan is CPU bound, so the
+    // number of requests in flight is capped at the number of CPUs.
+    let max_in_flight = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .max(2);
+    let in_flight = Arc::new(tokio::sync::Semaphore::new(max_in_flight));
+
     let mut line = String::new();
 
     loop {
@@ -5953,25 +6010,46 @@ async fn run_stdio_server(server: Arc<McpServer>) -> Result<()> {
                     Ok(request) => {
                         // Check if this is a notification (no id) or a request (has id)
                         if request.get("id").is_some() {
-                            // It's a request, send a response
-                            let response = server.handle_request(request).await;
-                            if let Ok(response_str) = serde_json::to_string(&response) {
+                            // It's a request, answer it from a task of its
+                            // own, see max_in_flight above.
+                            let server = server.clone();
+                            let stdout = stdout.clone();
+                            let in_flight = in_flight.clone();
+                            tokio::spawn(async move {
+                                let Ok(_permit) = in_flight.acquire_owned().await else {
+                                    return;
+                                };
+                                // The handlers borrow their arguments across
+                                // awaits in a way rustc can't prove Send for,
+                                // so drive the request on a thread of the
+                                // blocking pool instead. That also keeps a
+                                // CPU bound scan off the runtime's workers.
+                                let handle = tokio::runtime::Handle::current();
+                                let Ok(response) = tokio::task::spawn_blocking(move || {
+                                    handle.block_on(server.handle_request(request))
+                                })
+                                .await
+                                else {
+                                    return;
+                                };
+                                let Ok(response_str) = serde_json::to_string(&response) else {
+                                    return;
+                                };
                                 let mut stdout_guard = stdout.lock().await;
                                 if let Err(e) =
                                     stdout_guard.write_all(response_str.as_bytes()).await
                                 {
                                     eprintln!("Failed to write response: {e}");
-                                    break;
+                                    return;
                                 }
                                 if let Err(e) = stdout_guard.write_all(b"\n").await {
                                     eprintln!("Failed to write newline: {e}");
-                                    break;
+                                    return;
                                 }
                                 if let Err(e) = stdout_guard.flush().await {
                                     eprintln!("Failed to flush stdout: {e}");
-                                    break;
                                 }
-                            }
+                            });
                         } else {
                             // It's a notification, handle without response
                             let method = request["method"].as_str().unwrap_or("");
@@ -6074,13 +6152,14 @@ async fn main() -> Result<()> {
     tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
     // Run MCP server on stdio
-    run_stdio_server(server).await?;
+    let served = run_stdio_server(server).await;
+    semcode::notify::stopping();
 
     // Gracefully shutdown the background indexing task
     indexing_handle.abort();
     let _ = indexing_handle.await;
 
-    Ok(())
+    served
 }
 
 #[cfg(test)]
