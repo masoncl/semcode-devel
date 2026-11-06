@@ -1975,6 +1975,9 @@ struct Args {
     lazy: bool,
 }
 
+/// How long a lookup waits for the startup pass before it is told to retry.
+const STARTUP_WAIT_SECONDS: u64 = 30;
+
 #[derive(Debug, Clone)]
 enum IndexingStatus {
     NotStarted,
@@ -2912,17 +2915,34 @@ impl McpServer {
     }
 
     async fn check_database_status(&self) -> Option<String> {
-        let state = self.indexing_state.lock().await;
-
-        // Check if indexing is currently in progress
-        if matches!(state.status, IndexingStatus::InProgress { .. }) {
-            if let IndexingStatus::InProgress { ref phase, .. } = state.status {
+        // The startup pass first checks whether HEAD is indexed, which takes a
+        // moment, and indexes it when it is not, which can take long. Wait for
+        // the first case instead of sending the caller away; only a pass that
+        // is still running after that is reported.
+        let wait_until =
+            tokio::time::Instant::now() + std::time::Duration::from_secs(STARTUP_WAIT_SECONDS);
+        let state = loop {
+            let state = self.indexing_state.lock().await;
+            let busy = matches!(
+                state.status,
+                IndexingStatus::NotStarted | IndexingStatus::InProgress { .. }
+            );
+            if !busy {
+                break state;
+            }
+            if tokio::time::Instant::now() >= wait_until {
+                let phase = match &state.status {
+                    IndexingStatus::InProgress { phase, .. } => phase.clone(),
+                    _ => "starting".to_string(),
+                };
                 return Some(format!(
                     "Database is currently being indexed ({}). Please wait for indexing to complete and try again. Use the indexing_status tool to check progress.",
                     phase
                 ));
             }
-        }
+            drop(state);
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        };
 
         // Check if indexing failed
         if let IndexingStatus::Failed { ref error } = state.status {

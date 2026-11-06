@@ -160,8 +160,10 @@ All `*_patterns` arrays below are OR'd within the array.
 ## Startup and readiness
 
 At startup the server checks whether the index covers the current commit
-of the repository and indexes it when it does not; lookups that arrive
-meanwhile are told to retry.
+of the repository and indexes it when it does not. Lookups that arrive
+meanwhile wait for the check (up to 30 seconds) rather than being told
+to retry; only an indexing pass that is still running after that gets
+the "currently being indexed" answer.
 
 The server speaks the sd_notify(3) protocol: when NOTIFY_SOCKET is set
 it sends `STATUS=` lines for the phases and `READY=1` once lookups are
